@@ -1,28 +1,46 @@
-{{/* mlflow enable tracking features */}}
-{{- define "mlflow.enableTracking" -}}
-{{- if not .Values.trackingServer.enabled -}}
---artifacts-only
-{{- end -}}
-{{- end -}}
-
 {{/* mlflow server port */}}
 {{- define "mlflow.serverPort" -}}
-{{- if .Values.trackingServer.port -}}
---port={{ .Values.trackingServer.port }}
+{{- if .Values.containerPort -}}
+--port={{ .Values.containerPort }}
 {{- end -}}
 {{- end -}}
 
 {{/* mlflow server worker */}}
 {{- define "mlflow.serverWorkers" -}}
-{{- if .Values.trackingServer.workers -}}
---workers={{ .Values.trackingServer.workers }}
+{{- if .Values.workers -}}
+--workers={{ .Values.workers }}
 {{- end -}}
 {{- end -}}
 
 {{/* mlflow server metrics */}}
 {{- define "mlflow.serverMetrics" -}}
-{{- if .Values.trackingServer.metrics -}}
+{{- if .Values.workers -}}
 --expose-prometheus=/metrics
+{{- end -}}
+{{- end -}}
+
+{{/* mlflow default artifact root */}}
+{{- define "mlflow.defaultArtifactRoot" -}}
+{{- if .Values.defaultArtifactRoot -}}
+--default-artifact-root={{ .Values.defaultArtifactRoot }}
+{{- end -}}
+{{- end -}}
+
+{{/* mlflow backend store uri */}}
+{{- define "mlflow.backendStoreUri" -}}
+{{- if .Values.backendStoreUri -}}
+{{- if .Values.artifacts.only -}}
+{{- fail "cannot set backend store uri when artifacts.only is true" -}}
+{{- else -}}
+--backend-store-uri={{ .Values.backendStoreUri }}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+
+{{/* mlflow disable tracking features */}}
+{{- define "mlflow.artifactsOnly" -}}
+{{- if .Values.artifacts.only -}}
+--artifacts-only
 {{- end -}}
 {{- end -}}
 
@@ -30,24 +48,33 @@
 {{- define "mlflow.proxyArtifacts" -}}
 {{- if .Values.artifacts.serve -}}
 --serve-artifacts
+{{- else if .Values.artifacts.only -}}
+{{- fail "cannot disable both experiment tracking and artifacts serving" -}}
 {{- else -}}
 --no-serve-artifacts
+{{- end -}}
+{{- end -}}
+
+{{/* mlflow artifacts destination */}}
+{{- define "mlflow.artifactsDestination" -}}
+{{- if .Values.artifacts.destination -}}
+--artifacts-destination={{ .Values.artifacts.destination }}
 {{- end -}}
 {{- end -}}
 
 
 {{/* mlflow deployment container command for launching the tracking server */}}
 {{- define "mlflow.trackingServerArgs" -}}
-{{- $args := list (include "mlflow.enableTracking" .)
+{{- $args := list (include "mlflow.artifactsOnly" .)
                   (include "mlflow.serverPort" .)
                   (include "mlflow.serverWorkers" .)
                   (include "mlflow.serverMetrics" .)
-                  (include "mlflow.proxyArtifacts" .) -}}
+                  (include "mlflow.defaultArtifactRoot" .)
+                  (include "mlflow.proxyArtifacts" .)
+                  (include "mlflow.artifactsDestination" .) -}}
 - mlflow
 - server
 - --host=0.0.0.0
-- --backend-store-uri=$(BACKEND_STORE_URI)
-- --default-artifact-root=$(DEFAULT_ARTIFACT_ROOT)
 {{- range $args }}
 {{- if . }}
 - {{ . }}
