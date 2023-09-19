@@ -2,11 +2,12 @@
 This module provides utilities for performing Azure Blob Storage operations without requiring
 the heavyweight azure-storage-blob library dependency
 """
-from copy import deepcopy
-import urllib
 import logging
+import urllib
+from copy import deepcopy
 
 from mlflow.utils import rest_utils
+from mlflow.utils.file_utils import read_chunk
 
 _logger = logging.getLogger(__name__)
 _PUT_BLOCK_HEADERS = {
@@ -38,16 +39,19 @@ def put_adls_file_creation(sas_url, headers):
         rest_utils.augmented_raise_for_status(response)
 
 
-def patch_adls_file_upload(sas_url, data, position, headers, is_single):
+def patch_adls_file_upload(sas_url, local_file, start_byte, size, position, headers, is_single):
     """
     Performs an ADLS Azure file create `Patch` operation
     (https://docs.microsoft.com/en-us/rest/api/storageservices/datalakestoragegen2/path/update)
 
     :param sas_url: A shared access signature URL referring to the Azure ADLS server
                     to which the file update command should be issued.
-    :param data: Data to include in the Patch request body.
+    :param local_file: The local file to upload
+    :param start_byte: The starting byte of the local file to upload
+    :param size: The number of bytes to upload
     :param position: Positional offset of the data in the Patch request
     :param headers: Additional headers to include in the Patch request body
+    :param is_single: Whether this is the only patch operation for this file
     """
     new_params = {"action": "append", "position": str(position)}
     if is_single:
@@ -61,6 +65,7 @@ def patch_adls_file_upload(sas_url, data, position, headers, is_single):
         else:
             _logger.debug("Removed unsupported '%s' header for ADLS Gen2 Patch operation", name)
 
+    data = read_chunk(local_file, size, start_byte)
     with rest_utils.cloud_storage_http_request(
         "patch", request_url, data=data, headers=request_headers
     ) as response:
@@ -153,8 +158,7 @@ def _append_query_parameters(url, parameters):
     query_dict.update(parameters)
     new_query = urllib.parse.urlencode(query_dict)
     new_url_components = parsed_url._replace(query=new_query)
-    new_url = urllib.parse.urlunparse(new_url_components)
-    return new_url
+    return urllib.parse.urlunparse(new_url_components)
 
 
 def _build_block_list_xml(block_list):

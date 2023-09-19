@@ -1,7 +1,8 @@
 import posixpath
-from unittest import mock
-import pytest
 import time
+from unittest import mock
+
+import pytest
 
 from mlflow.entities import FileInfo
 from mlflow.exceptions import MlflowException
@@ -92,6 +93,31 @@ def test_download_artifacts_does_not_infinitely_loop(base_uri, download_arg, lis
         list_artifacts_mock.side_effect = list_artifacts
         repo = ArtifactRepositoryImpl(base_uri)
         repo.download_artifacts(download_arg)
+
+
+def test_download_artifacts_download_file():
+    with mock.patch.object(ArtifactRepositoryImpl, "list_artifacts", return_value=[]):
+        repo = ArtifactRepositoryImpl(_PARENT_DIR)
+        repo.download_artifacts(_MODEL_FILE)
+
+
+def test_download_artifacts_dst_path_does_not_exist(tmp_path):
+    repo = ArtifactRepositoryImpl(_PARENT_DIR)
+    dst_path = tmp_path.joinpath("does_not_exist")
+    with pytest.raises(
+        MlflowException, match="The destination path for downloaded artifacts does not exist"
+    ):
+        repo.download_artifacts(_MODEL_DIR, dst_path)
+
+
+def test_download_artifacts_dst_path_is_file(tmp_path):
+    repo = ArtifactRepositoryImpl(_PARENT_DIR)
+    dst_path = tmp_path.joinpath("file")
+    dst_path.touch()
+    with pytest.raises(
+        MlflowException, match="The destination path for downloaded artifacts must be a directory"
+    ):
+        repo.download_artifacts(_MODEL_DIR, dst_path)
 
 
 @pytest.mark.parametrize(

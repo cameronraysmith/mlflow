@@ -1,13 +1,12 @@
-import json
-import pandas as pd
-from sklearn.linear_model import LinearRegression
-from sklearn.datasets import fetch_california_housing
-from sklearn.model_selection import train_test_split
-import numpy as np
-import mlflow
-from mlflow.models import make_metric
 import matplotlib.pyplot as plt
-import os
+import numpy as np
+import pandas as pd
+from sklearn.datasets import fetch_california_housing
+from sklearn.linear_model import LinearRegression
+from sklearn.model_selection import train_test_split
+
+import mlflow
+from mlflow.models import infer_signature, make_metric
 
 # loading the California housing dataset
 cali_housing = fetch_california_housing(as_frame=True)
@@ -19,6 +18,10 @@ X_train, X_test, y_train, y_test = train_test_split(
 
 # train the model
 lin_reg = LinearRegression().fit(X_train, y_train)
+
+# Infer model signature
+predictions = lin_reg.predict(X_train)
+signature = infer_signature(X_train, predictions)
 
 # creating the evaluation dataframe
 eval_data = X_test.copy()
@@ -58,7 +61,7 @@ def custom_artifact(eval_df, builtin_metrics, _artifacts_dir):
 
 
 with mlflow.start_run() as run:
-    mlflow.sklearn.log_model(lin_reg, "model")
+    mlflow.sklearn.log_model(lin_reg, "model", signature=signature)
     model_uri = mlflow.get_artifact_uri("model")
     result = mlflow.evaluate(
         model=model_uri,

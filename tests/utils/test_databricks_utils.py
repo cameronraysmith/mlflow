@@ -1,19 +1,21 @@
-import os
+import builtins
 import sys
 from unittest import mock
+
 import pytest
+from databricks_cli.configure.provider import DatabricksConfig
 
 from mlflow.exceptions import MlflowException
 from mlflow.utils import databricks_utils
 from mlflow.utils.databricks_utils import (
-    get_workspace_info_from_dbutils,
+    check_databricks_secret_scope_access,
+    get_mlflow_credential_context_by_run_id,
     get_workspace_info_from_databricks_secrets,
+    get_workspace_info_from_dbutils,
     is_databricks_default_tracking_uri,
     is_running_in_ipython_environment,
 )
 from mlflow.utils.uri import construct_db_uri_from_profile
-
-from databricks_cli.configure.provider import DatabricksConfig
 
 from tests.helper_functions import mock_method_chain
 
@@ -214,10 +216,11 @@ def test_databricks_params_throws_errors(ProfileConfigProvider):
         databricks_utils.get_databricks_host_creds()
 
 
-def test_is_in_databricks_runtime():
-    with mock.patch.dict(os.environ, {"DATABRICKS_RUNTIME_VERSION": "11.x"}):
-        assert databricks_utils.is_in_databricks_runtime()
+def test_is_in_databricks_runtime(monkeypatch):
+    monkeypatch.setenv("DATABRICKS_RUNTIME_VERSION", "11.x")
+    assert databricks_utils.is_in_databricks_runtime()
 
+    monkeypatch.delenv("DATABRICKS_RUNTIME_VERSION")
     assert not databricks_utils.is_in_databricks_runtime()
 
 
@@ -237,8 +240,6 @@ def test_get_repl_id():
     mock_spark = mock.MagicMock()
     mock_spark.SparkContext = mock_sparkcontext_class
 
-    import builtins
-
     original_import = builtins.__import__
 
     def mock_import(name, *args, **kwargs):
@@ -251,10 +252,10 @@ def test_get_repl_id():
         assert databricks_utils.get_repl_id() == "testReplId2"
 
 
-def test_use_repl_context_if_available(tmpdir, monkeypatch):
+def test_use_repl_context_if_available(tmp_path, monkeypatch):
     # Simulate a case where `dbruntime.databricks_repl_context.get_context` is unavailable.
     with pytest.raises(ModuleNotFoundError, match="No module named 'dbruntime'"):
-        from dbruntime.databricks_repl_context import get_context  # pylint: disable=unused-import
+        from dbruntime.databricks_repl_context import get_context  # noqa: F401
 
     command_context_mock = mock.MagicMock()
     command_context_mock.jobId().get.return_value = "job_id"
@@ -268,13 +269,15 @@ def test_use_repl_context_if_available(tmpdir, monkeypatch):
         mock_get_command_context.assert_called_once()
 
     # Create a fake databricks_repl_context module
-    tmpdir.mkdir("dbruntime").join("databricks_repl_context.py").write(
+    dbruntime = tmp_path.joinpath("dbruntime")
+    dbruntime.mkdir()
+    dbruntime.joinpath("databricks_repl_context.py").write_text(
         """
 def get_context():
     pass
 """
     )
-    monkeypatch.syspath_prepend(tmpdir.strpath)
+    monkeypatch.syspath_prepend(str(tmp_path))
 
     # Simulate a case where the REPL context object is not initialized.
     with mock.patch(
@@ -284,9 +287,7 @@ def get_context():
         "mlflow.utils.databricks_utils._get_command_context", return_value=command_context_mock
     ) as mock_get_command_context:
         assert databricks_utils.get_job_id() == "job_id"
-        assert databricks_utils.get_experiment_name_from_job_id("job_id") == "jobs:/job_id"
-        assert databricks_utils.get_job_type_info() == "NORMAL"
-        assert mock_get_command_context.call_count == 2
+        assert mock_get_command_context.call_count == 1
 
     with mock.patch(
         "dbruntime.databricks_repl_context.get_context",
@@ -336,3 +337,43 @@ def test_is_running_in_ipython_environment_works(get_ipython):
 
         with mock.patch("IPython.get_ipython", return_value=get_ipython):
             assert is_running_in_ipython_environment() == (get_ipython is not None)
+
+
+def test_get_mlflow_credential_context_by_run_id():
+    with mock.patch(
+        "mlflow.tracking.artifact_utils.get_artifact_uri", return_value="dbfs:/path/to/artifact"
+    ) as mock_get_artifact_uri, mock.patch(
+        "mlflow.utils.uri.get_databricks_profile_uri_from_artifact_uri",
+        return_value="databricks://path/to/profile",
+    ) as mock_get_databricks_profile, mock.patch(
+        "mlflow.utils.databricks_utils.MlflowCredentialContext"
+    ) as mock_credential_context:
+        get_mlflow_credential_context_by_run_id(run_id="abc")
+        mock_get_artifact_uri.assert_called_once_with(run_id="abc")
+        mock_get_databricks_profile.assert_called_once_with("dbfs:/path/to/artifact")
+        mock_credential_context.assert_called_once_with("databricks://path/to/profile")
+
+
+def test_check_databricks_secret_scope_access():
+    mock_dbutils = mock.MagicMock()
+    mock_dbutils.secrets.list.return_value = "random"
+    with mock.patch("mlflow.utils.databricks_utils._get_dbutils", return_value=mock_dbutils):
+        check_databricks_secret_scope_access("scope")
+        mock_dbutils.secrets.list.assert_called_once_with("scope")
+
+
+def test_check_databricks_secret_scope_access_error():
+    mock_dbutils = mock.MagicMock()
+    mock_dbutils.secrets.list.side_effect = Exception("no scope access")
+    with mock.patch(
+        "mlflow.utils.databricks_utils._get_dbutils", return_value=mock_dbutils
+    ), mock.patch("mlflow.utils.databricks_utils._logger.warning") as mock_warning:
+        check_databricks_secret_scope_access("scope")
+        mock_warning.assert_called_once_with(
+            "Unable to access Databricks secret scope 'scope' for OpenAI credentials that will be "
+            "used to deploy the model to Databricks Model Serving. Please verify that the current "
+            "Databricks user has 'READ' permission for this scope. For more information, see "
+            "https://mlflow.org/docs/latest/python_api/openai/index.html#credential-management-for-openai-on-databricks. "  # pylint: disable=line-too-long
+            "Error: no scope access"
+        )
+        mock_dbutils.secrets.list.assert_called_once_with("scope")

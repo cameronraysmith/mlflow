@@ -1,7 +1,7 @@
 import React, { useState } from 'react';
 import { IntlProvider } from 'react-intl';
 import { Provider } from 'react-redux';
-import { StaticRouter } from 'react-router-dom';
+import { MemoryRouter } from '../../../../../common/utils/RoutingUtils';
 import { applyMiddleware, compose, createStore } from 'redux';
 import promiseMiddleware from 'redux-promise-middleware';
 import { EXPERIMENT_RUNS_MOCK_STORE } from '../../fixtures/experiment-runs.fixtures';
@@ -10,6 +10,7 @@ import { experimentRunsSelector } from '../../utils/experimentRuns.selector';
 import { SearchExperimentRunsFacetsState } from '../../models/SearchExperimentRunsFacetsState';
 import { SearchExperimentRunsViewState } from '../../models/SearchExperimentRunsViewState';
 import { GetExperimentRunsContextProvider } from '../../contexts/GetExperimentRunsContext';
+import { useRunSortOptions } from '../../hooks/useRunSortOptions';
 
 const MOCK_EXPERIMENT = EXPERIMENT_RUNS_MOCK_STORE.entities.experimentsById['123456789'];
 
@@ -28,6 +29,8 @@ const createComponentWrapper = (viewState: SearchExperimentRunsViewState) => () 
     new SearchExperimentRunsFacetsState(),
   );
 
+  const sortOptions = useRunSortOptions(['metric1'], ['param1']);
+
   return (
     <Provider
       store={createStore(
@@ -36,7 +39,7 @@ const createComponentWrapper = (viewState: SearchExperimentRunsViewState) => () 
         compose(applyMiddleware(promiseMiddleware())),
       )}
     >
-      <StaticRouter location='/'>
+      <MemoryRouter>
         <GetExperimentRunsContextProvider actions={{} as any}>
           <IntlProvider locale='en'>
             <div
@@ -52,11 +55,10 @@ const createComponentWrapper = (viewState: SearchExperimentRunsViewState) => () 
               runsData={MOCK_RUNS_DATA}
               searchFacetsState={searchFacetsState}
               viewState={viewState}
-              updateSearchFacets={() => {}}
             />
           </IntlProvider>
         </GetExperimentRunsContextProvider>
-      </StaticRouter>
+      </MemoryRouter>
     </Provider>
   );
 };

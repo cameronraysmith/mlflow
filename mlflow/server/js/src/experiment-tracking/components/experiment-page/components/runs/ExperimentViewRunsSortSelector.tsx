@@ -1,10 +1,15 @@
 import {
+  DialogCombobox,
+  DialogComboboxContent,
+  DialogComboboxOptionList,
+  DialogComboboxOptionListSearch,
+  DialogComboboxOptionListSelectItem,
+  DialogComboboxTrigger,
   ArrowDownIcon,
   ArrowUpIcon,
-  Option,
-  Select,
   SortAscendingIcon,
   SortDescendingIcon,
+  useDesignSystemTheme,
 } from '@databricks/design-system';
 import React, { useMemo } from 'react';
 import { FormattedMessage } from 'react-intl';
@@ -28,6 +33,7 @@ export const ExperimentViewRunsSortSelector = React.memo(
     onSortKeyChanged: (valueContainer: any) => void;
   }) => {
     const { orderByKey, orderByAsc } = searchFacetsState;
+    const { theme } = useDesignSystemTheme();
 
     // Currently used canonical "sort by" value in form of "COLUMN_NAME***DIRECTION", e.g. "metrics.`metric`***DESCENDING"
     const currentSortSelectValue = useMemo(
@@ -64,7 +70,6 @@ export const ExperimentViewRunsSortSelector = React.memo(
           sortOptionLabel = extractedKeyName[1];
         }
       }
-
       return (
         <span css={{ display: 'flex', alignItems: 'center', gap: 4 }}>
           {orderByAsc ? <SortAscendingIcon /> : <SortDescendingIcon />}{' '}
@@ -77,43 +82,38 @@ export const ExperimentViewRunsSortSelector = React.memo(
       );
     }, [currentSortSelectValue, orderByAsc, orderByKey, sortOptions]);
 
+    const handleChange = (updatedValue: string) => {
+      onSortKeyChanged({ value: updatedValue });
+    };
+
+    const handleClear = () => {
+      onSortKeyChanged({ value: '' });
+    };
+
     return (
-      <Select
-        className='sort-select'
-        css={styles.sortSelectControl}
-        value={{
-          value: currentSortSelectValue,
-          label: currentSortSelectLabel,
-        }}
-        labelInValue
-        // Temporarily we're disabling virtualized list to maintain
-        // backwards compatibility. Functional unit tests rely heavily
-        // on non-virtualized values.
-        virtual={false}
-        dangerouslySetAntdProps={{ dropdownStyle: styles.sortSelectDropdown }}
-        onChange={onSortKeyChanged}
-        data-test-id='sort-select-dropdown'
-      >
-        {sortOptions.map((sortOption) => (
-          <Option
-            key={sortOption.value}
-            title={sortOption.label}
-            data-test-id={`sort-select-${sortOption.label}-${sortOption.order}`}
-            value={sortOption.value}
-          >
-            <span css={styles.sortMenuArrowWrapper}>
-              {sortOption.order === COLUMN_SORT_BY_ASC ? <ArrowUpIcon /> : <ArrowDownIcon />}
-            </span>{' '}
-            {middleTruncateStr(sortOption.label, 50)}
-          </Option>
-        ))}
-      </Select>
+      <DialogCombobox label={currentSortSelectLabel}>
+        <DialogComboboxTrigger onClear={handleClear} data-test-id='sort-select-dropdown' />
+        <DialogComboboxContent minWidth={250}>
+          <DialogComboboxOptionList>
+            <DialogComboboxOptionListSearch>
+              {sortOptions.map((sortOption) => (
+                <DialogComboboxOptionListSelectItem
+                  key={sortOption.value}
+                  value={sortOption.value}
+                  onChange={handleChange}
+                  checked={sortOption.value === currentSortSelectValue}
+                  data-test-id={`sort-select-${sortOption.label}-${sortOption.order}`}
+                >
+                  <span css={{ display: 'flex', alignItems: 'center', gap: 4 }}>
+                    {sortOption.order === COLUMN_SORT_BY_ASC ? <ArrowUpIcon /> : <ArrowDownIcon />}
+                    {middleTruncateStr(sortOption.label, 50)}
+                  </span>
+                </DialogComboboxOptionListSelectItem>
+              ))}
+            </DialogComboboxOptionListSearch>
+          </DialogComboboxOptionList>
+        </DialogComboboxContent>
+      </DialogCombobox>
     );
   },
 );
-
-const styles = {
-  sortSelectControl: { minWidth: 140, maxWidth: 360 },
-  sortSelectDropdown: { minWidth: 360 },
-  sortMenuArrowWrapper: { svg: { width: 12, height: 12 } },
-};

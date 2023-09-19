@@ -1,25 +1,35 @@
+import logging
 import os
 import posixpath
 import tempfile
-from abc import abstractmethod, ABCMeta
-from collections import namedtuple
-from concurrent.futures import ThreadPoolExecutor
+from abc import ABCMeta, abstractmethod
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
+from mlflow.entities.file_info import FileInfo
+from mlflow.environment_variables import MLFLOW_ENABLE_ARTIFACTS_PROGRESS_BAR
 from mlflow.exceptions import MlflowException
 from mlflow.protos.databricks_pb2 import INVALID_PARAMETER_VALUE, RESOURCE_DOES_NOT_EXIST
 from mlflow.utils.annotations import developer_stable
-from mlflow.utils.validation import path_not_unique, bad_path_message
-
+from mlflow.utils.file_utils import ArtifactProgressBar
+from mlflow.utils.validation import bad_path_message, path_not_unique
 
 # Constants used to determine max level of parallelism to use while uploading/downloading artifacts.
 # Max threads to use for parallelism.
-_NUM_MAX_THREADS = 8
+_NUM_MAX_THREADS = 20
 # Max threads per CPU
 _NUM_MAX_THREADS_PER_CPU = 2
 assert _NUM_MAX_THREADS >= _NUM_MAX_THREADS_PER_CPU
 assert _NUM_MAX_THREADS_PER_CPU > 0
 # Default number of CPUs to assume on the machine if unavailable to fetch it using os.cpu_count()
 _NUM_DEFAULT_CPUS = _NUM_MAX_THREADS // _NUM_MAX_THREADS_PER_CPU
+_logger = logging.getLogger(__name__)
+
+
+def _truncate_error(err: str, max_length: int = 10_000) -> str:
+    if len(err) <= max_length:
+        return err
+    half = max_length // 2
+    return err[:half] + "\n\n*** Error message is too long, truncated ***\n\n" + err[-half:]
 
 
 @developer_stable
@@ -36,7 +46,10 @@ class ArtifactRepository:
         # Limit the number of threads used for artifact uploads/downloads. Use at most
         # constants._NUM_MAX_THREADS threads or 2 * the number of CPU cores available on the
         # system (whichever is smaller)
-        self.thread_pool = ThreadPoolExecutor(max_workers=self.max_workers)
+        self.thread_pool = self._create_thread_pool()
+
+    def _create_thread_pool(self):
+        return ThreadPoolExecutor(max_workers=self.max_workers)
 
     @abstractmethod
     def log_artifact(self, local_file, artifact_path=None):
@@ -107,6 +120,24 @@ class ArtifactRepository:
             os.makedirs(local_dir_path, exist_ok=True)
         return local_file_path
 
+    def _iter_artifacts_recursive(self, path):
+        dir_content = [
+            file_info
+            for file_info in self.list_artifacts(path)
+            # prevent infinite loop, sometimes the dir is recursively included
+            if file_info.path not in [".", path]
+        ]
+        # Empty directory
+        if not dir_content:
+            yield FileInfo(path=path, is_dir=True, file_size=None)
+            return
+
+        for file_info in dir_content:
+            if file_info.is_dir:
+                yield from self._iter_artifacts_recursive(file_info.path)
+            else:
+                yield file_info
+
     def download_artifacts(self, artifact_path, dst_path=None):
         """
         Download an artifact file or directory to a local directory if applicable, and return a
@@ -122,156 +153,79 @@ class ArtifactRepository:
 
         :return: Absolute path of the local filesystem location containing the desired artifacts.
         """
-        # Represents an in-progress file artifact download to a local filesystem location
-        InflightDownload = namedtuple(
-            "InflightDownload",
-            [
-                # The artifact path, given relative to the repository's artifact root location
-                "src_artifact_path",
-                # The local filesystem destination path to which artifacts are being downloaded
-                "dst_local_path",
-                # A future representing the artifact download operation
-                "download_future",
-            ],
-        )
+        if dst_path:
+            dst_path = os.path.abspath(dst_path)
+            if not os.path.exists(dst_path):
+                raise MlflowException(
+                    message=(
+                        "The destination path for downloaded artifacts does not"
+                        f" exist! Destination path: {dst_path}"
+                    ),
+                    error_code=RESOURCE_DOES_NOT_EXIST,
+                )
+            elif not os.path.isdir(dst_path):
+                raise MlflowException(
+                    message=(
+                        "The destination path for downloaded artifacts must be a directory!"
+                        f" Destination path: {dst_path}"
+                    ),
+                    error_code=INVALID_PARAMETER_VALUE,
+                )
+        else:
+            dst_path = tempfile.mkdtemp()
 
-        def async_download_artifact(src_artifact_path, dst_local_dir_path):
-            """
-            Download the file artifact specified by `src_artifact_path` to the local filesystem
-            directory specified by `dst_local_dir_path`.
-            :param src_artifact_path: A relative, POSIX-style path referring to a file artifact
-                                      stored within the repository's artifact root location.
-                                      `src_artifact_path` should be specified relative to the
-                                      repository's artifact root location.
-            :param dst_local_dir_path: Absolute path of the local filesystem destination directory
-                                       to which to download the specified artifact. The downloaded
-                                       artifact may be written to a subdirectory of
-                                       `dst_local_dir_path` if `src_artifact_path` contains
-                                       subdirectories.
-            :return: A local filesystem path referring to the downloaded file.
-            """
-            inflight_downloads = []
-            local_destination_file_path = self._create_download_destination(
+        def _download_file(src_artifact_path, dst_local_dir_path):
+            dst_local_file_path = self._create_download_destination(
                 src_artifact_path=src_artifact_path, dst_local_dir_path=dst_local_dir_path
             )
-            download_future = self.thread_pool.submit(
+            return self.thread_pool.submit(
                 self._download_file,
                 remote_file_path=src_artifact_path,
-                local_path=local_destination_file_path,
-            )
-            inflight_downloads.append(
-                InflightDownload(
-                    src_artifact_path=src_artifact_path,
-                    dst_local_path=local_destination_file_path,
-                    download_future=download_future,
-                )
-            )
-            return inflight_downloads
-
-        def async_download_artifact_dir(src_artifact_dir_path, dst_local_dir_path):
-            """
-            Initiate an asynchronous download of the artifact directory specified by
-            `src_artifact_dir_path` to the local filesystem directory specified by
-            `dst_local_dir_path`.
-
-            This implementation is adapted from
-            https://github.com/mlflow/mlflow/blob/a776b54fa8e1beeca6a984864c6375e9ed38f8c0/mlflow/
-            store/artifact/artifact_repo.py#L93.
-
-            :param src_artifact_dir_path: A relative, POSIX-style path referring to a directory of
-                                          of artifacts stored within the repository's artifact root
-                                          location. `src_artifact_dir_path` should be specified
-                                          relative to the repository's artifact root location.
-            :param dst_local_dir_path: Absolute path of the local filesystem destination directory
-                                       to which to download the specified artifact directory. The
-                                       downloaded artifacts may be written to a subdirectory of
-                                       `dst_local_dir_path` if `src_artifact_dir_path` contains
-                                       subdirectories.
-            :return: A tuple whose first element is the destination directory of the downloaded
-                     artifacts on the local filesystem and whose second element is a list of
-                     `InflightDownload` objects, each of which represents an inflight asynchronous
-                     download operation for a file in the specified artifact directory.
-            """
-            local_dir = os.path.join(dst_local_dir_path, src_artifact_dir_path)
-            inflight_downloads = []
-            dir_content = [  # prevent infinite loop, sometimes the dir is recursively included
-                file_info
-                for file_info in self.list_artifacts(src_artifact_dir_path)
-                if file_info.path != "." and file_info.path != src_artifact_dir_path
-            ]
-            if not dir_content:  # empty dir
-                if not os.path.exists(local_dir):
-                    os.makedirs(local_dir, exist_ok=True)
-            else:
-                for file_info in dir_content:
-                    if file_info.is_dir:
-                        inflight_downloads += async_download_artifact_dir(
-                            src_artifact_dir_path=file_info.path,
-                            dst_local_dir_path=dst_local_dir_path,
-                        )[1]
-                    else:
-                        inflight_downloads += async_download_artifact(
-                            src_artifact_path=file_info.path,
-                            dst_local_dir_path=dst_local_dir_path,
-                        )
-            return local_dir, inflight_downloads
-
-        if dst_path is None:
-            dst_path = tempfile.mkdtemp()
-        dst_path = os.path.abspath(dst_path)
-
-        if not os.path.exists(dst_path):
-            raise MlflowException(
-                message=(
-                    "The destination path for downloaded artifacts does not"
-                    f" exist! Destination path: {dst_path}"
-                ),
-                error_code=RESOURCE_DOES_NOT_EXIST,
-            )
-        elif not os.path.isdir(dst_path):
-            raise MlflowException(
-                message=(
-                    "The destination path for downloaded artifacts must be a directory!"
-                    f" Destination path: {dst_path}"
-                ),
-                error_code=INVALID_PARAMETER_VALUE,
+                local_path=dst_local_file_path,
             )
 
-        # Check if the artifacts points to a directory
+        # Submit download tasks
+        futures = {}
         if self._is_directory(artifact_path):
-            dst_local_path, inflight_downloads = async_download_artifact_dir(
-                src_artifact_dir_path=artifact_path, dst_local_dir_path=dst_path
-            )
+            for file_info in self._iter_artifacts_recursive(artifact_path):
+                if file_info.is_dir:  # Empty directory
+                    os.makedirs(os.path.join(dst_path, file_info.path), exist_ok=True)
+                else:
+                    fut = _download_file(file_info.path, dst_path)
+                    futures[fut] = file_info.path
         else:
-            inflight_downloads = async_download_artifact(
-                src_artifact_path=artifact_path, dst_local_dir_path=dst_path
-            )
-            assert (
-                len(inflight_downloads) == 1
-            ), "Expected one inflight download for a file artifact, got {} downloads".format(
-                len(inflight_downloads)
-            )
-            dst_local_path = inflight_downloads[0].dst_local_path
+            fut = _download_file(artifact_path, dst_path)
+            futures[fut] = artifact_path
 
-        # Join futures to ensure that all artifacts have been downloaded prior to returning
+        # Wait for downloads to complete and collect failures
         failed_downloads = {}
-        for inflight_download in inflight_downloads:
-            try:
-                inflight_download.download_future.result()
-            except Exception as e:
-                failed_downloads[inflight_download.src_artifact_path] = repr(e)
+        with ArtifactProgressBar.files(desc="Downloading artifacts", total=len(futures)) as pbar:
+            if len(futures) >= 10 and pbar.pbar:
+                _logger.info(
+                    "The progress bar can be disabled by setting the environment "
+                    f"variable {MLFLOW_ENABLE_ARTIFACTS_PROGRESS_BAR} to false"
+                )
+            for f in as_completed(futures):
+                try:
+                    f.result()
+                    pbar.update()
+                except Exception as e:
+                    path = futures[f]
+                    failed_downloads[path] = e
 
-        if len(failed_downloads) > 0:
+        if failed_downloads:
+            template = "##### File {path} #####\n{error}"
+            failures = "\n".join(
+                template.format(path=path, error=error) for path, error in failed_downloads.items()
+            )
             raise MlflowException(
                 message=(
                     "The following failures occurred while downloading one or more"
-                    " artifacts from {artifact_root}: {failures}".format(
-                        artifact_root=self.artifact_uri,
-                        failures=failed_downloads,
-                    )
+                    f" artifacts from {self.artifact_uri}:\n{_truncate_error(failures)}"
                 )
             )
-        return dst_local_path
+
+        return os.path.join(dst_path, artifact_path)
 
     @abstractmethod
     def _download_file(self, remote_file_path, local_path):
@@ -304,5 +258,5 @@ class ArtifactRepository:
 def verify_artifact_path(artifact_path):
     if artifact_path and path_not_unique(artifact_path):
         raise MlflowException(
-            "Invalid artifact path: '{}'. {}".format(artifact_path, bad_path_message(artifact_path))
+            f"Invalid artifact path: '{artifact_path}'. {bad_path_message(artifact_path)}"
         )

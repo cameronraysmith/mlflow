@@ -17,59 +17,69 @@ LightGBM (native) format
 .. _scikit-learn API:
     https://lightgbm.readthedocs.io/en/latest/Python-API.html#scikit-learn-api
 """
-import os
-import yaml
-import json
-import tempfile
-import shutil
-import logging
 import functools
+import json
+import logging
+import os
+import tempfile
 from copy import deepcopy
+from typing import Any, Dict, Optional
+
+import yaml
 from packaging.version import Version
 
 import mlflow
 from mlflow import pyfunc
-from mlflow.models import Model, infer_signature
+from mlflow.data.code_dataset_source import CodeDatasetSource
+from mlflow.data.numpy_dataset import from_numpy
+from mlflow.data.pandas_dataset import from_pandas
+from mlflow.entities.dataset_input import DatasetInput
+from mlflow.entities.input_tag import InputTag
+from mlflow.models import Model, ModelInputExample, ModelSignature, infer_signature
 from mlflow.models.model import MLMODEL_FILE_NAME
-from mlflow.models.signature import ModelSignature
-from mlflow.models.utils import ModelInputExample, _save_example
+from mlflow.models.signature import _infer_signature_from_input_example
+from mlflow.models.utils import _save_example
+from mlflow.sklearn import _SklearnTrainingSession
+from mlflow.tracking._model_registry import DEFAULT_AWAIT_MAX_SLEEP_SECONDS
 from mlflow.tracking.artifact_utils import _download_artifact_from_uri
+from mlflow.tracking.context import registry as context_registry
 from mlflow.utils import _get_fully_qualified_class_name
-from mlflow.utils.environment import (
-    _mlflow_conda_env,
-    _validate_env_arguments,
-    _process_pip_requirements,
-    _process_conda_env,
-    _CONDA_ENV_FILE_NAME,
-    _REQUIREMENTS_FILE_NAME,
-    _CONSTRAINTS_FILE_NAME,
-    _PYTHON_ENV_FILE_NAME,
-    _PythonEnv,
-)
-from mlflow.utils.requirements_utils import _get_pinned_requirement
-from mlflow.utils.file_utils import write_to
-from mlflow.utils.docstring_utils import format_docstring, LOG_MODEL_PARAM_DOCS
-from mlflow.utils.model_utils import (
-    _get_flavor_configuration,
-    _validate_and_copy_code_paths,
-    _add_code_from_conf_to_system_path,
-    _validate_and_prepare_target_save_path,
-)
 from mlflow.utils.arguments_utils import _get_arg_names
 from mlflow.utils.autologging_utils import (
-    autologging_integration,
-    safe_patch,
-    picklable_exception_safe_function,
-    get_mlflow_run_params_for_fn_args,
-    INPUT_EXAMPLE_SAMPLE_ROWS,
-    resolve_input_example_and_signature,
-    InputExampleInfo,
     ENSURE_AUTOLOGGING_ENABLED_TEXT,
-    batch_metrics_logger,
+    INPUT_EXAMPLE_SAMPLE_ROWS,
+    InputExampleInfo,
     MlflowAutologgingQueueingClient,
+    autologging_integration,
+    batch_metrics_logger,
+    get_mlflow_run_params_for_fn_args,
+    picklable_exception_safe_function,
+    resolve_input_example_and_signature,
+    safe_patch,
 )
-from mlflow.tracking._model_registry import DEFAULT_AWAIT_MAX_SLEEP_SECONDS
-from mlflow.sklearn import _SklearnTrainingSession
+from mlflow.utils.docstring_utils import LOG_MODEL_PARAM_DOCS, format_docstring
+from mlflow.utils.environment import (
+    _CONDA_ENV_FILE_NAME,
+    _CONSTRAINTS_FILE_NAME,
+    _PYTHON_ENV_FILE_NAME,
+    _REQUIREMENTS_FILE_NAME,
+    _mlflow_conda_env,
+    _process_conda_env,
+    _process_pip_requirements,
+    _PythonEnv,
+    _validate_env_arguments,
+)
+from mlflow.utils.file_utils import write_to
+from mlflow.utils.mlflow_tags import (
+    MLFLOW_DATASET_CONTEXT,
+)
+from mlflow.utils.model_utils import (
+    _add_code_from_conf_to_system_path,
+    _get_flavor_configuration,
+    _validate_and_copy_code_paths,
+    _validate_and_prepare_target_save_path,
+)
+from mlflow.utils.requirements_utils import _get_pinned_requirement
 
 FLAVOR_NAME = "lightgbm"
 
@@ -120,26 +130,8 @@ def save_model(
                        containing file dependencies). These files are *prepended* to the system
                        path when the model is loaded.
     :param mlflow_model: :py:mod:`mlflow.models.Model` this flavor is being added to.
-
-    :param signature: :py:class:`ModelSignature <mlflow.models.ModelSignature>`
-                      describes model input and output :py:class:`Schema <mlflow.types.Schema>`.
-                      The model signature can be :py:func:`inferred <mlflow.models.infer_signature>`
-                      from datasets with valid model input (e.g. the training dataset with target
-                      column omitted) and valid model output (e.g. model predictions generated on
-                      the training dataset), for example:
-
-                      .. code-block:: python
-
-                        from mlflow.models.signature import infer_signature
-
-                        train = df.drop_column("target_label")
-                        predictions = ...  # compute model predictions
-                        signature = infer_signature(train, predictions)
-    :param input_example: Input example provides one or several instances of valid
-                          model input. The example can be used as a hint of what data to feed the
-                          model. The given example will be converted to a Pandas DataFrame and then
-                          serialized to json using the Pandas split-oriented format. Bytes are
-                          base64-encoded.
+    :param signature: {{ signature }}
+    :param input_example: {{ input_example }}
     :param pip_requirements: {{ pip_requirements }}
     :param extra_pip_requirements: {{ extra_pip_requirements }}
     :param metadata: Custom metadata dictionary passed to the model and stored in the MLmodel file.
@@ -186,6 +178,12 @@ def save_model(
     model_data_subpath = "model.lgb" if isinstance(lgb_model, lgb.Booster) else "model.pkl"
     model_data_path = os.path.join(path, model_data_subpath)
     code_dir_subpath = _validate_and_copy_code_paths(code_paths, path)
+
+    if signature is None and input_example is not None:
+        wrapped_model = _LGBModelWrapper(lgb_model)
+        signature = _infer_signature_from_input_example(input_example, wrapped_model)
+    elif signature is False:
+        signature = None
 
     if mlflow_model is None:
         mlflow_model = Model()
@@ -298,25 +296,8 @@ def log_model(
                                   ``registered_model_name``, also creating a registered model if one
                                   with the given name does not exist.
 
-    :param signature: :py:class:`ModelSignature <mlflow.models.ModelSignature>`
-                      describes model input and output :py:class:`Schema <mlflow.types.Schema>`.
-                      The model signature can be :py:func:`inferred <mlflow.models.infer_signature>`
-                      from datasets with valid model input (e.g. the training dataset with target
-                      column omitted) and valid model output (e.g. model predictions generated on
-                      the training dataset), for example:
-
-                      .. code-block:: python
-
-                        from mlflow.models.signature import infer_signature
-
-                        train = df.drop_column("target_label")
-                        predictions = ...  # compute model predictions
-                        signature = infer_signature(train, predictions)
-    :param input_example: Input example provides one or several instances of valid
-                          model input. The example can be used as a hint of what data to feed the
-                          model. The given example will be converted to a Pandas DataFrame and then
-                          serialized to json using the Pandas split-oriented format. Bytes are
-                          base64-encoded.
+    :param signature: {{ signature }}
+    :param input_example: {{ input_example }}
     :param await_registration_for: Number of seconds to wait for the model version to finish
                             being created and is in ``READY`` status. By default, the function
                             waits for five minutes. Specify 0 or None to skip waiting.
@@ -336,6 +317,7 @@ def log_model(
         from lightgbm import LGBMClassifier
         from sklearn import datasets
         import mlflow
+        from mlflow.models import infer_signature
 
         # Load iris dataset
         X, y = datasets.load_iris(return_X_y=True, as_frame=True)
@@ -346,10 +328,14 @@ def log_model(
         # Train the model
         model.fit(X, y)
 
+        # Create model signature
+        predictions = model.predict(X)
+        signature = infer_signature(X, predictions)
+
         # Log the model
         artifact_path = "model"
         with mlflow.start_run():
-            model_info = mlflow.lightgbm.log_model(model, artifact_path)
+            model_info = mlflow.lightgbm.log_model(model, artifact_path, signature=signature)
 
         # Fetch the logged model artifacts
         print(f"run_id: {run.info.run_id}")
@@ -448,6 +434,9 @@ def load_model(model_uri, dst_path=None):
         from sklearn import datasets
         import mlflow
 
+        # Auto log all MLflow entities
+        mlflow.lightgbm.autolog()
+
         # Load iris dataset
         X, y = datasets.load_iris(return_X_y=True, as_frame=True)
 
@@ -457,12 +446,9 @@ def load_model(model_uri, dst_path=None):
         # Train the model
         model.fit(X, y)
 
-        # Log the model
-        with mlflow.start_run():
-            model_info = mlflow.lightgbm.log_model(model, artifact_path="model")
-
         # Load model for inference
-        loaded_model = mlflow.lightgbm.load_model(model_info.model_uri)
+        model_uri = f"runs:/{mlflow.last_active_run().info.run_id}/model"
+        loaded_model = mlflow.lightgbm.load_model(model_uri)
         print(loaded_model.predict(X[:5]))
 
     .. code-block:: text
@@ -480,7 +466,18 @@ class _LGBModelWrapper:
     def __init__(self, lgb_model):
         self.lgb_model = lgb_model
 
-    def predict(self, dataframe):
+    def predict(
+        self, dataframe, params: Optional[Dict[str, Any]] = None
+    ):  # pylint: disable=unused-argument
+        """
+        :param dataframe: Model input data.
+        :param params: Additional parameters to pass to the model for inference.
+
+                       .. Note:: Experimental: This parameter may change or be removed in a future
+                                               release without warning.
+
+        :return: Model predictions.
+        """
         return self.lgb_model.predict(dataframe)
 
 
@@ -515,11 +512,13 @@ def autolog(
     log_input_examples=False,
     log_model_signatures=True,
     log_models=True,
+    log_datasets=True,
     disable=False,
     exclusive=False,
     disable_for_unsupported_versions=False,
     silent=False,
     registered_model_name=None,
+    extra_tags=None,
 ):  # pylint: disable=unused-argument
     """
     Enables (or disables) and configures autologging from LightGBM to MLflow. Logs the following:
@@ -551,6 +550,8 @@ def autolog(
                        If ``False``, trained models are not logged.
                        Input examples and model signatures, which are attributes of MLflow models,
                        are also omitted when ``log_models`` is ``False``.
+    :param log_datasets: If ``True``, train and validation dataset information is logged to MLflow
+                         Tracking if applicable. If ``False``, dataset information is not logged.
     :param disable: If ``True``, disables the LightGBM autologging integration. If ``False``,
                     enables the LightGBM autologging integration.
     :param exclusive: If ``True``, autologged content is not logged to user-created fluent runs.
@@ -565,6 +566,7 @@ def autolog(
     :param registered_model_name: If given, each time a model is trained, it is registered as a
                                   new model version of the registered model with this name.
                                   The registered model is created if it does not already exist.
+    :param extra_tags: A dictionary of extra tags to set on each managed run created by autologging.
 
     .. code-block:: python
         :caption: Example
@@ -656,7 +658,7 @@ def autolog(
 
         original(self, *args, **kwargs)
 
-    def train_impl(_log_models, original, *args, **kwargs):
+    def train_impl(_log_models, _log_datasets, original, *args, **kwargs):
         def record_eval_results(eval_results, metrics_logger):
             """
             Create a callback function that records evaluation results.
@@ -692,15 +694,14 @@ def autolog(
             ax.set_title(f"Feature Importance ({importance_type})")
             fig.tight_layout()
 
-            tmpdir = tempfile.mkdtemp()
-            try:
-                # pylint: disable=undefined-loop-variable
-                filepath = os.path.join(tmpdir, f"feature_importance_{imp_type}.png")
-                fig.savefig(filepath)
-                mlflow.log_artifact(filepath)
-            finally:
-                plt.close(fig)
-                shutil.rmtree(tmpdir)
+            with tempfile.TemporaryDirectory() as tmpdir:
+                try:
+                    # pylint: disable=undefined-loop-variable
+                    filepath = os.path.join(tmpdir, f"feature_importance_{imp_type}.png")
+                    fig.savefig(filepath)
+                    mlflow.log_artifact(filepath)
+                finally:
+                    plt.close(fig)
 
         autologging_client = MlflowAutologgingQueueingClient()
 
@@ -741,6 +742,36 @@ def autolog(
         eval_results = []
         callbacks_index = all_arg_names.index("callbacks")
         run_id = mlflow.active_run().info.run_id
+
+        train_set = args[1] if len(args) > 1 else kwargs.get("train_set")
+
+        # Whether to automatically log the training dataset as a dataset artifact.
+        if _log_datasets and train_set:
+            try:
+                context_tags = context_registry.resolve_tags()
+                source = CodeDatasetSource(tags=context_tags)
+
+                _log_lightgbm_dataset(train_set, source, "train", autologging_client)
+
+                valid_sets = kwargs.get("valid_sets")
+                if valid_sets is not None:
+                    valid_names = kwargs.get("valid_names")
+                    if valid_names is None:
+                        for valid_set in valid_sets:
+                            _log_lightgbm_dataset(valid_set, source, "eval", autologging_client)
+                    else:
+                        for valid_set, valid_name in zip(valid_sets, valid_names):
+                            _log_lightgbm_dataset(
+                                valid_set, source, "eval", autologging_client, name=valid_name
+                            )
+
+                dataset_logging_operations = autologging_client.flush(synchronous=False)
+                dataset_logging_operations.await_completion()
+            except Exception as e:
+                _logger.warning(
+                    "Failed to log dataset information to MLflow Tracking. Reason: %s", e
+                )
+
         with batch_metrics_logger(run_id) as metrics_logger:
             callback = record_eval_results(eval_results, metrics_logger)
             if num_pos_args >= callbacks_index + 1:
@@ -790,18 +821,13 @@ def autolog(
                 )
 
             imp = dict(zip(features, importance.tolist()))
-            tmpdir = tempfile.mkdtemp()
-            try:
+            with tempfile.TemporaryDirectory() as tmpdir:
                 filepath = os.path.join(tmpdir, f"feature_importance_{imp_type}.json")
                 with open(filepath, "w") as f:
                     json.dump(imp, f, indent=2)
                 mlflow.log_artifact(filepath)
-            finally:
-                shutil.rmtree(tmpdir)
 
         # train_set must exist as the original train function already ran successfully
-        train_set = args[1] if len(args) > 1 else kwargs.get("train_set")
-
         # it is possible that the dataset was constructed before the patched
         #   constructor was applied, so we cannot assume the input_example_info exists
         input_example_info = getattr(train_set, "input_example_info", None)
@@ -815,8 +841,7 @@ def autolog(
 
         def infer_model_signature(input_example):
             model_output = model.predict(input_example)
-            model_signature = infer_signature(input_example, model_output)
-            return model_signature
+            return infer_signature(input_example, model_output)
 
         # Whether to automatically log the trained model based on boolean flag.
         if _log_models:
@@ -843,16 +868,21 @@ def autolog(
 
         return model
 
-    def train(_log_models, original, *args, **kwargs):
+    def train(_log_models, _log_datasets, original, *args, **kwargs):
         with _SklearnTrainingSession(estimator=lightgbm.train, allow_children=False) as t:
             if t.should_log():
-                return train_impl(_log_models, original, *args, **kwargs)
+                return train_impl(_log_models, _log_datasets, original, *args, **kwargs)
             else:
                 return original(*args, **kwargs)
 
     safe_patch(FLAVOR_NAME, lightgbm.Dataset, "__init__", __init__)
     safe_patch(
-        FLAVOR_NAME, lightgbm, "train", functools.partial(train, log_models), manage_run=True
+        FLAVOR_NAME,
+        lightgbm,
+        "train",
+        functools.partial(train, log_models, log_datasets),
+        manage_run=True,
+        extra_tags=extra_tags,
     )
     # The `train()` method logs LightGBM models as Booster objects. When using LightGBM
     # scikit-learn models, we want to save / log models as their model classes. So we turn
@@ -861,7 +891,12 @@ def autolog(
     # in `mlflow.sklearn._autolog()`, where models are logged as LightGBM scikit-learn models
     # after the `fit()` method returns.
     safe_patch(
-        FLAVOR_NAME, lightgbm.sklearn, "train", functools.partial(train, False), manage_run=True
+        FLAVOR_NAME,
+        lightgbm.sklearn,
+        "train",
+        functools.partial(train, False, log_datasets),
+        manage_run=True,
+        extra_tags=extra_tags,
     )
 
     # enable LightGBM scikit-learn estimators autologging
@@ -872,10 +907,36 @@ def autolog(
         log_input_examples=log_input_examples,
         log_model_signatures=log_model_signatures,
         log_models=log_models,
+        log_datasets=log_datasets,
         disable=disable,
         exclusive=exclusive,
         disable_for_unsupported_versions=disable_for_unsupported_versions,
         silent=silent,
         max_tuning_runs=None,
         log_post_training_metrics=True,
+        extra_tags=extra_tags,
     )
+
+
+def _log_lightgbm_dataset(lgb_dataset, source, context, autologging_client, name=None):
+    import numpy as np
+    import pandas as pd
+    from scipy.sparse import issparse
+
+    data = lgb_dataset.data
+    label = lgb_dataset.label
+    if isinstance(data, pd.DataFrame):
+        dataset = from_pandas(df=data, source=source, name=name)
+    elif issparse(data):
+        arr_data = data.toarray() if issparse(data) else data
+        dataset = from_numpy(features=arr_data, targets=label, source=source, name=name)
+    elif isinstance(data, np.ndarray):
+        dataset = from_numpy(features=data, targets=label, source=source, name=name)
+    else:
+        _logger.warning("Unrecognized dataset type %s. Dataset logging skipped.", type(data))
+        return
+    tags = [InputTag(key=MLFLOW_DATASET_CONTEXT, value=context)]
+    dataset_input = DatasetInput(dataset=dataset._to_mlflow_entity(), tags=tags)
+
+    # log the dataset
+    autologging_client.log_inputs(run_id=mlflow.active_run().info.run_id, datasets=[dataset_input])

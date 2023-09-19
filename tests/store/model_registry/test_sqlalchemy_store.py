@@ -1,28 +1,30 @@
-import os
-from unittest import mock
+import time
 import uuid
+from unittest import mock
+
 import pytest
 
 from mlflow.entities.model_registry import (
     ModelVersion,
-    RegisteredModelTag,
     ModelVersionTag,
+    RegisteredModelTag,
 )
+from mlflow.environment_variables import MLFLOW_TRACKING_URI
 from mlflow.exceptions import MlflowException
-from mlflow.store.model_registry.dbmodels.models import (
-    SqlRegisteredModel,
-    SqlRegisteredModelTag,
-    SqlModelVersion,
-    SqlModelVersionTag,
-)
-from mlflow.tracking._tracking_service.utils import _TRACKING_URI_ENV_VAR
 from mlflow.protos.databricks_pb2 import (
-    ErrorCode,
-    RESOURCE_DOES_NOT_EXIST,
     INVALID_PARAMETER_VALUE,
     RESOURCE_ALREADY_EXISTS,
+    RESOURCE_DOES_NOT_EXIST,
+    ErrorCode,
+)
+from mlflow.store.model_registry.dbmodels.models import (
+    SqlModelVersion,
+    SqlModelVersionTag,
+    SqlRegisteredModel,
+    SqlRegisteredModelTag,
 )
 from mlflow.store.model_registry.sqlalchemy_store import SqlAlchemyStore
+
 from tests.helper_functions import random_str
 
 pytestmark = pytest.mark.notrackingurimock
@@ -30,7 +32,7 @@ pytestmark = pytest.mark.notrackingurimock
 
 @pytest.fixture
 def store(tmp_sqlite_uri):
-    db_uri_from_env_var = os.getenv(_TRACKING_URI_ENV_VAR)
+    db_uri_from_env_var = MLFLOW_TRACKING_URI.get()
     store = SqlAlchemyStore(db_uri_from_env_var if db_uri_from_env_var else tmp_sqlite_uri)
     yield store
 
@@ -128,8 +130,7 @@ def test_get_registered_model(store):
         RegisteredModelTag("anotherKey", "some other value"),
     ]
     # use fake clock
-    with mock.patch("time.time") as mock_time:
-        mock_time.return_value = 1234
+    with mock.patch("time.time", return_value=1234):
         rm = _rm_maker(store, name, tags)
         assert rm.name == name
     rmd = store.get_registered_model(name=name)
@@ -433,8 +434,7 @@ def test_create_model_version(store):
     name = "test_for_update_MV"
     _rm_maker(store, name)
     run_id = uuid.uuid4().hex
-    with mock.patch("time.time") as mock_time:
-        mock_time.return_value = 456778
+    with mock.patch("time.time", return_value=456778):
         mv1 = _mv_maker(store, name, "a/b/CD", run_id)
         assert mv1.name == name
         assert mv1.version == 1
@@ -748,23 +748,28 @@ def test_search_model_versions(store):
         ]
 
     # search using name should return all 4 versions
-    assert set(search_versions("name='%s'" % name)) == {1, 2, 3, 4}
+    assert set(search_versions(f"name='{name}'")) == {1, 2, 3, 4}
 
     # search using version
     assert set(search_versions("version_number=2")) == {2}
     assert set(search_versions("version_number<=3")) == {1, 2, 3}
 
     # search using run_id_1 should return version 1
-    assert set(search_versions("run_id='%s'" % run_id_1)) == {1}
+    assert set(search_versions(f"run_id='{run_id_1}'")) == {1}
 
     # search using run_id_2 should return versions 2 and 3
-    assert set(search_versions("run_id='%s'" % run_id_2)) == {2, 3}
+    assert set(search_versions(f"run_id='{run_id_2}'")) == {2, 3}
 
     # search using the IN operator should return all versions
     assert set(search_versions(f"run_id IN ('{run_id_1}','{run_id_2}')")) == {1, 2, 3}
 
     # search IN operator is case sensitive
     assert set(search_versions(f"run_id IN ('{run_id_1.upper()}','{run_id_2}')")) == {2, 3}
+
+    # search IN operator with other conditions
+    assert set(
+        search_versions(f"version_number=2 AND run_id IN ('{run_id_1.upper()}','{run_id_2}')")
+    ) == {2}
 
     # search IN operator with right-hand side value containing whitespaces
     assert set(search_versions(f"run_id IN ('{run_id_1}', '{run_id_2}')")) == {1, 2, 3}
@@ -852,7 +857,7 @@ def test_search_model_versions(store):
 
     assert set(search_versions(None)) == {1, 2, 3}
 
-    assert set(search_versions("name='%s'" % name)) == {1, 2, 3}
+    assert set(search_versions(f"name='{name}'")) == {1, 2, 3}
 
     assert set(search_versions("source_path = 'A/D'")) == {3}
 
@@ -864,7 +869,7 @@ def test_search_model_versions(store):
         name=mv1.name, version=mv1.version, description="Online prediction model!"
     )
 
-    mvds = store.search_model_versions("run_id = '%s'" % run_id_1, max_results=10)
+    mvds = store.search_model_versions(f"run_id = '{run_id_1}'", max_results=10)
     assert len(mvds) == 1
     assert isinstance(mvds[0], ModelVersion)
     assert mvds[0].current_stage == "Production"
@@ -881,6 +886,7 @@ def test_search_model_versions_order_by_simple(store):
     for name in set(names):
         _rm_maker(store, name)
     for i in range(6):
+        time.sleep(0.001)  # sleep to ensure each model version has a different creation_time
         _mv_maker(store, name=names[i], source=sources[i], run_id=run_ids[i])
 
     # by default order by last_updated_timestamp DESC
@@ -1060,7 +1066,7 @@ def test_search_registered_models(store):
     assert rms == names
 
     # equality search using name should return exactly the 1 name
-    rms, _ = _search_registered_models(store, "name='{}'".format(names[0]))
+    rms, _ = _search_registered_models(store, f"name='{names[0]}'")
     assert rms == [names[0]]
 
     # equality search using name that is not valid should return nothing
@@ -1131,7 +1137,7 @@ def test_search_registered_models(store):
     with pytest.raises(
         MlflowException, match=r"Invalid attribute key 'run_id' specified."
     ) as exception_context:
-        _search_registered_models(store, "run_id='%s'" % "somerunID")
+        _search_registered_models(store, "run_id='somerunID'")
     assert exception_context.value.error_code == ErrorCode.Name(INVALID_PARAMETER_VALUE)
 
     # cannot search by source_path
@@ -1153,7 +1159,7 @@ def test_search_registered_models(store):
     assert _search_registered_models(store, None, max_results=1000) == (names[:-1], None)
 
     # equality search using name should return no names
-    assert _search_registered_models(store, "name='{}'".format(names[-1])) == ([], None)
+    assert _search_registered_models(store, f"name='{names[-1]}'") == ([], None)
 
     # case-sensitive prefix search using LIKE should return all the RMs
     assert _search_registered_models(store, f"name LIKE '{prefix}%'") == (
@@ -1576,3 +1582,60 @@ def test_delete_model_version_tag(store):
     ) as exception_context:
         store.delete_model_version_tag(name1, "I am not a version", "key")
     assert exception_context.value.error_code == ErrorCode.Name(INVALID_PARAMETER_VALUE)
+
+
+def _setup_and_test_aliases(store, model_name):
+    store.create_registered_model(model_name)
+    run_id_1 = uuid.uuid4().hex
+    run_id_2 = uuid.uuid4().hex
+    store.create_model_version(model_name, "v1", run_id_1)
+    store.create_model_version(model_name, "v2", run_id_2)
+    store.set_registered_model_alias(model_name, "test_alias", "2")
+    model = store.get_registered_model(model_name)
+    assert model.aliases == {"test_alias": 2}
+    mv1 = store.get_model_version(model_name, 1)
+    mv2 = store.get_model_version(model_name, 2)
+    assert mv1.aliases == []
+    assert mv2.aliases == ["test_alias"]
+
+
+def test_set_registered_model_alias(store):
+    _setup_and_test_aliases(store, "SetRegisteredModelAlias_TestMod")
+
+
+def test_delete_registered_model_alias(store):
+    model_name = "DeleteRegisteredModelAlias_TestMod"
+    _setup_and_test_aliases(store, model_name)
+    store.delete_registered_model_alias(model_name, "test_alias")
+    model = store.get_registered_model(model_name)
+    assert model.aliases == {}
+    mv2 = store.get_model_version(model_name, 2)
+    assert mv2.aliases == []
+
+
+def test_get_model_version_by_alias(store):
+    model_name = "GetModelVersionByAlias_TestMod"
+    _setup_and_test_aliases(store, model_name)
+    mv = store.get_model_version_by_alias(model_name, "test_alias")
+    assert mv.aliases == ["test_alias"]
+
+
+def test_delete_model_version_deletes_alias(store):
+    model_name = "DeleteModelVersionDeletesAlias_TestMod"
+    _setup_and_test_aliases(store, model_name)
+    store.delete_model_version(model_name, 2)
+    model = store.get_registered_model(model_name)
+    assert model.aliases == {}
+    with pytest.raises(MlflowException, match=r"Registered model alias test_alias not found."):
+        store.get_model_version_by_alias(model_name, "test_alias")
+
+
+def test_delete_model_deletes_alias(store):
+    model_name = "DeleteModelDeletesAlias_TestMod"
+    _setup_and_test_aliases(store, model_name)
+    store.delete_registered_model(model_name)
+    with pytest.raises(
+        MlflowException,
+        match=r"Registered model alias test_alias not found.",
+    ):
+        store.get_model_version_by_alias(model_name, "test_alias")

@@ -1,6 +1,13 @@
+import json
 import os
 import posixpath
+import shutil
+import subprocess
+
+import click
 import pytest
+
+from mlflow.environment_variables import _MLFLOW_TESTING, MLFLOW_TRACKING_URI
 
 
 def pytest_addoption(parser):
@@ -29,6 +36,19 @@ def pytest_configure(config):
     config.addinivalue_line("markers", "allow_infer_pip_requirements_fallback")
 
 
+def pytest_sessionstart(session):
+    if uri := MLFLOW_TRACKING_URI.get():
+        click.echo(
+            click.style(
+                (
+                    f"Environment variable {MLFLOW_TRACKING_URI} is set to {uri!r}, "
+                    "which may interfere with tests."
+                ),
+                fg="red",
+            )
+        )
+
+
 def pytest_runtest_setup(item):
     markers = [mark.name for mark in item.iter_markers()]
     if "requires_ssh" in markers and not item.config.getoption("--requires-ssh"):
@@ -43,40 +63,52 @@ def pytest_ignore_collect(path, config):
 
         # Ignored files and directories must be included in dev/run-python-flavor-tests.sh
         model_flavors = [
-            "tests/h2o",
-            "tests/keras",
-            "tests/pytorch",
-            "tests/pyfunc",
-            "tests/sagemaker",
-            "tests/sklearn",
-            "tests/spark",
-            "tests/mleap",
-            "tests/tensorflow",
+            # Tests of flavor modules.
             "tests/azureml",
-            "tests/onnx",
-            "tests/gluon",
-            "tests/xgboost",
-            "tests/lightgbm",
             "tests/catboost",
-            "tests/statsmodels",
-            "tests/spacy",
-            "tests/fastai",
-            "tests/models",
-            "tests/shap",
-            "tests/paddle",
-            "tests/prophet",
-            "tests/pmdarima",
             "tests/diviner",
+            "tests/fastai",
+            "tests/gluon",
+            "tests/h2o",
+            "tests/johnsnowlabs",
+            "tests/keras",
+            "tests/keras_core",
+            "tests/langchain",
+            "tests/lightgbm",
+            "tests/mleap",
+            "tests/models",
+            "tests/onnx",
+            "tests/openai",
+            "tests/paddle",
+            "tests/pmdarima",
+            "tests/prophet",
+            "tests/pyfunc",
+            "tests/pytorch",
+            "tests/sagemaker",
+            "tests/sentence_transformers",
+            "tests/shap",
+            "tests/sklearn",
+            "tests/spacy",
+            "tests/spark",
+            "tests/statsmodels",
+            "tests/tensorflow",
+            "tests/transformers",
+            "tests/xgboost",
+            # Lazy loading test.
             "tests/test_mlflow_lazily_imports_ml_packages.py",
+            # Tests of utils.
             "tests/utils/test_model_utils.py",
-            # this test is included here because it imports many big libraries like tf, keras, etc
+            # This test is included here because it imports many big libraries like tf, keras, etc.
             "tests/tracking/fluent/test_fluent_autolog.py",
-            # cross flavor autologging related tests.
+            # Cross flavor autologging related tests.
             "tests/autologging/test_autologging_safety_unit.py",
             "tests/autologging/test_autologging_behaviors_unit.py",
             "tests/autologging/test_autologging_behaviors_integration.py",
             "tests/autologging/test_autologging_utils.py",
             "tests/autologging/test_training_session.py",
+            # Opt in authentication feature.
+            "tests/server/auth",
+            "tests/gateway",
         ]
 
         relpath = os.path.relpath(str(path))
@@ -110,3 +142,26 @@ def pytest_terminal_summary(
             ids = list(dict.fromkeys(report.fspath for report in failed_test_reports))
         terminalreporter.write(" ".join(["pytest"] + ids))
         terminalreporter.write("\n" * 2)
+
+
+@pytest.fixture(scope="module", autouse=True)
+def clean_up_envs():
+    yield
+
+    if "GITHUB_ACTIONS" in os.environ:
+        from mlflow.utils.virtualenv import _get_mlflow_virtualenv_root
+
+        shutil.rmtree(_get_mlflow_virtualenv_root(), ignore_errors=True)
+        if os.name != "nt":
+            conda_info = json.loads(subprocess.check_output(["conda", "info", "--json"], text=True))
+            root_prefix = conda_info["root_prefix"]
+            for env in conda_info["envs"]:
+                if env != root_prefix:
+                    shutil.rmtree(env, ignore_errors=True)
+
+
+@pytest.fixture(scope="session", autouse=True)
+def enable_mlflow_testing():
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setenv(_MLFLOW_TESTING.name, "TRUE")
+        yield

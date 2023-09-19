@@ -1,6 +1,6 @@
-import { Skeleton } from '@databricks/design-system';
+import { LegacySkeleton } from '@databricks/design-system';
 
-import { useEffect } from 'react';
+import { useEffect, useState } from 'react';
 import { ErrorCodes } from '../../../common/constants';
 import NotFoundPage from '../NotFoundPage';
 import { PermissionDeniedView } from '../PermissionDeniedView';
@@ -12,8 +12,14 @@ import { ExperimentViewRuns } from './components/runs/ExperimentViewRuns';
 import { useExperimentIds } from './hooks/useExperimentIds';
 import { useExperiments } from './hooks/useExperiments';
 import { useFetchExperiments } from './hooks/useFetchExperiments';
+import { useElementHeight } from '../../../common/utils/useElementHeight';
+import { useAsyncDispatch } from './hooks/useAsyncDispatch';
+import { searchDatasetsApi } from '../../actions';
+import Utils from '../../../common/utils/Utils';
 
 export const ExperimentView = () => {
+  const dispatch = useAsyncDispatch();
+
   const experimentIds = useExperimentIds();
   const experiments = useExperiments(experimentIds);
 
@@ -21,9 +27,20 @@ export const ExperimentView = () => {
 
   const { fetchExperiments, isLoadingExperiment, requestError } = useFetchExperiments();
 
+  const { elementHeight: hideableElementHeight, observeHeight } = useElementHeight();
+
+  const [isMaximized, setIsMaximized] = useState(false);
+
   useEffect(() => {
     fetchExperiments(experimentIds);
   }, [fetchExperiments, experimentIds]);
+
+  useEffect(() => {
+    const requestAction = searchDatasetsApi(experimentIds);
+    dispatch(requestAction).catch((e) => {
+      Utils.logErrorAndNotifyUser(e);
+    });
+  }, [dispatch, experimentIds]);
 
   const isComparingExperiments = experimentIds.length > 1;
 
@@ -35,23 +52,41 @@ export const ExperimentView = () => {
     return <NotFoundPage />;
   }
 
-  if (isLoadingExperiment || !firstExperiment) {
-    return <Skeleton active />;
-  }
+  const isLoading = isLoadingExperiment || !experiments[0];
 
   return (
     <div css={styles.experimentViewWrapper}>
-      {isComparingExperiments ? (
-        <ExperimentViewHeaderCompare experiments={experiments} />
+      {isLoading ? (
+        <LegacySkeleton title paragraph={false} active />
       ) : (
         <>
-          <ExperimentViewHeader experiment={firstExperiment} />
-          <ExperimentViewDescriptions experiment={firstExperiment} />
-          <ExperimentViewNotes experiment={firstExperiment} />
+          {isComparingExperiments ? (
+            <ExperimentViewHeaderCompare experiments={experiments} />
+          ) : (
+            <>
+              <ExperimentViewHeader experiment={firstExperiment} />
+              <div
+                style={{
+                  maxHeight: isMaximized ? 0 : hideableElementHeight,
+                }}
+                css={{ overflowY: 'hidden', flexShrink: 0, transition: 'max-height .12s' }}
+              >
+                <div ref={observeHeight}>
+                  <ExperimentViewDescriptions experiment={firstExperiment} />
+                  <ExperimentViewNotes experiment={firstExperiment} />
+                </div>
+              </div>
+            </>
+          )}
         </>
       )}
 
-      <ExperimentViewRuns experiments={experiments} />
+      <ExperimentViewRuns
+        experiments={experiments}
+        isLoading={isLoading}
+        // We don't keep the view state on this level to maximize <ExperimentViewRuns>'s performance
+        onMaximizedChange={setIsMaximized}
+      />
     </div>
   );
 };

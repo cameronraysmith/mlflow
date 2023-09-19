@@ -1,29 +1,30 @@
 # pylint: disable=unused-argument
 
 import inspect
+import sys
 import time
-import pytest
 from collections import namedtuple
-from unittest.mock import Mock, call
 from unittest import mock
 
+import pytest
+
 import mlflow
-from mlflow.utils import gorilla
 from mlflow import MlflowClient
+from mlflow.utils import gorilla
 from mlflow.utils.autologging_utils import (
     AUTOLOGGING_INTEGRATIONS,
-    log_fn_args_as_params,
-    resolve_input_example_and_signature,
-    batch_metrics_logger,
     AutologgingEventLogger,
     BatchMetricsLogger,
     autologging_integration,
-    get_autologging_config,
     autologging_is_disabled,
+    batch_metrics_logger,
+    get_autologging_config,
     get_instance_method_first_arg_value,
     get_method_call_arg_value,
+    log_fn_args_as_params,
+    resolve_input_example_and_signature,
 )
-from mlflow.utils.autologging_utils.safety import _wrap_patch, AutologgingSession
+from mlflow.utils.autologging_utils.safety import AutologgingSession, _wrap_patch
 from mlflow.utils.autologging_utils.versioning import (
     FLAVOR_TO_MODULE_NAME_AND_VERSION_INFO_KEY,
     _check_version_in_range,
@@ -34,7 +35,6 @@ from mlflow.utils.autologging_utils.versioning import (
 )
 
 from tests.autologging.fixtures import test_mode_off
-
 
 # Example function signature we are testing on
 # def fn(arg1, default1=1, default2=2):
@@ -91,7 +91,7 @@ def start_run():
     mlflow.end_run()
 
 
-def dummy_fn(arg1, arg2="value2", arg3="value3"):  # pylint: disable=W0613
+def dummy_fn(arg1, arg2="value2", arg3="value3"):  # pylint: disable=unused-argument
     pass
 
 
@@ -110,7 +110,9 @@ log_test_args = [
 
 
 @pytest.mark.parametrize(("args", "kwargs", "expected"), log_test_args)
-def test_log_fn_args_as_params(args, kwargs, expected, start_run):  # pylint: disable=W0613
+def test_log_fn_args_as_params(
+    args, kwargs, expected, start_run
+):  # pylint: disable=unused-argument
     log_fn_args_as_params(dummy_fn, args, kwargs)
     client = MlflowClient()
     params = client.get_run(mlflow.active_run().info.run_id).data.params
@@ -119,7 +121,9 @@ def test_log_fn_args_as_params(args, kwargs, expected, start_run):  # pylint: di
         assert params[arg] == value
 
 
-def test_log_fn_args_as_params_ignores_unwanted_parameters(start_run):  # pylint: disable=W0613
+def test_log_fn_args_as_params_ignores_unwanted_parameters(
+    start_run,
+):  # pylint: disable=unused-argument
     args, kwargs, unlogged = ("arg1", {"arg2": "value"}, ["arg1", "arg2", "arg3"])
     log_fn_args_as_params(dummy_fn, args, kwargs, unlogged)
     client = MlflowClient()
@@ -154,8 +158,6 @@ def sample_function_to_patch(a, b):
 
 
 def test_wrap_patch_with_module():
-    import sys
-
     this_module = sys.modules[__name__]
 
     def new_sample_function(a, b):
@@ -167,9 +169,9 @@ def test_wrap_patch_with_module():
     assert sample_function_to_patch(10, 5) == 5
 
 
-@pytest.fixture()
+@pytest.fixture
 def logger():
-    return Mock()
+    return mock.Mock()
 
 
 def get_input_example():
@@ -193,8 +195,8 @@ def test_if_getting_input_example_fails(logger):
     assert input_example is None
     assert signature is None
     calls = [
-        call("Failed to gather input example: " + error_msg),
-        call(
+        mock.call("Failed to gather input example: " + error_msg),
+        mock.call(
             "Failed to infer model signature: "
             + "could not sample data to infer model signature: "
             + error_msg
@@ -214,7 +216,9 @@ def test_if_model_signature_inference_fails(logger):
     )
 
     assert input_example == "data"
-    assert signature is None
+    # When the signature inference fails but an input example is specified, `signature` is set
+    # to `False` to disable the automatic signature inference feature in `log_model` APIs.
+    assert signature is False
     logger.warning.assert_called_with("Failed to infer model signature: " + error_msg)
 
 
@@ -731,10 +735,6 @@ _module_version_info_dict_patch = {
         "package_info": {"pip_release": "lightgbm"},
         "autologging": {"minimum": "2.3.1", "maximum": "3.1.0"},
     },
-    "gluon": {
-        "package_info": {"pip_release": "mxnet"},
-        "autologging": {"minimum": "1.5.1", "maximum": "1.7.0.post1"},
-    },
     "fastai": {
         "package_info": {"pip_release": "fastai"},
         "autologging": {"minimum": "2.4.1", "maximum": "2.4.1"},
@@ -747,6 +747,10 @@ _module_version_info_dict_patch = {
         "package_info": {"pip_release": "pyspark"},
         "autologging": {"minimum": "3.0.1", "maximum": "3.1.1"},
     },
+    "transformers": {
+        "package_info": {"pip_release": "transformers"},
+        "autologging": {"minimum": "1.25.1", "maximum": "1.28.1"},
+    },
 }
 
 
@@ -756,8 +760,6 @@ _module_version_info_dict_patch = {
         ("fastai", "2.4.1", True),
         ("fastai", "2.3.1", False),
         ("fastai", "1.0.60", False),
-        ("gluon", "1.6.1", True),
-        ("gluon", "1.5.0", False),
         ("keras", "2.2.4", True),
         ("keras", "2.2.3", False),
         ("lightgbm", "2.3.1", True),
@@ -777,6 +779,8 @@ _module_version_info_dict_patch = {
         ("pytorch", "1.5.99", False),
         ("pyspark.ml", "3.1.0", True),
         ("pyspark.ml", "3.0.0", False),
+        ("transformers", "1.28.1", True),
+        ("transformers", "1.1.1", False),
     ],
 )
 @mock.patch(
@@ -793,16 +797,14 @@ def test_is_autologging_integration_supported(flavor, module_version, expected_r
     ("flavor", "module_version", "expected_result"),
     [
         ("pyspark.ml", "3.10.1.dev0", False),
+        ("pyspark.ml", "3.5.0.dev0", True),
         ("pyspark.ml", "3.3.0.dev0", True),
         ("pyspark.ml", "3.2.1.dev0", True),
         ("pyspark.ml", "3.1.2.dev0", True),
         ("pyspark.ml", "3.0.1.dev0", True),
-        ("pyspark.ml", "3.0.0.dev0", False),
+        ("pyspark.ml", "3.0.0.dev0", True),
+        ("pyspark.ml", "2.4.8.dev0", False),
     ],
-)
-@mock.patch(
-    "mlflow.utils.autologging_utils.versioning._ML_PACKAGE_VERSIONS",
-    _module_version_info_dict_patch,
 )
 def test_dev_version_pyspark_is_supported_in_databricks(flavor, module_version, expected_result):
     module_name, _ = FLAVOR_TO_MODULE_NAME_AND_VERSION_INFO_KEY[flavor]
@@ -889,7 +891,8 @@ def test_disable_for_unsupported_versions_warning_sklearn_integration():
             log_warn_fn.assert_not_called()
         with mock.patch(log_warn_fn_name) as log_warn_fn:
             mlflow.sklearn.autolog(disable_for_unsupported_versions=False)
-            assert log_warn_fn.call_count == 1 and is_sklearn_warning_fired(log_warn_fn.call_args)
+            assert log_warn_fn.call_count == 1
+            assert is_sklearn_warning_fired(log_warn_fn.call_args)
 
 
 def test_get_instance_method_first_arg_value():
@@ -910,9 +913,9 @@ def test_get_instance_method_first_arg_value():
     assert get_instance_method_first_arg_value(Test.f1, [3], {"cd2": 4}) == 3
     assert get_instance_method_first_arg_value(Test.f1, [], {"ab1": 3, "cd2": 4}) == 3
     assert get_instance_method_first_arg_value(Test.f2, [3, 4], {}) == 3
-    with pytest.raises(AssertionError, match=""):
+    with pytest.raises(AssertionError, match=r".*"):
         get_instance_method_first_arg_value(Test.f3, [], {"ab1": 3, "cd2": 4})
-    with pytest.raises(AssertionError, match=""):
+    with pytest.raises(AssertionError, match=r".*"):
         get_instance_method_first_arg_value(Test.f4, [], {"ab1": 3, "cd2": 4})
 
 

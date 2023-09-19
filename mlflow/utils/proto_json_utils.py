@@ -1,17 +1,16 @@
 import base64
 import datetime
-
-import os
 import json
-from json import JSONEncoder
-
-from google.protobuf.json_format import MessageToJson, ParseDict
-from google.protobuf.descriptor import FieldDescriptor
-
-from mlflow.exceptions import MlflowException
+import os
 from collections import defaultdict
 from functools import partial
+from json import JSONEncoder
+from typing import Any, Dict, Optional
 
+from google.protobuf.descriptor import FieldDescriptor
+from google.protobuf.json_format import MessageToJson, ParseDict
+
+from mlflow.exceptions import MlflowException
 
 _PROTOBUF_INT64_FIELDS = [
     FieldDescriptor.TYPE_INT64,
@@ -188,7 +187,7 @@ class NumpyEncoder(JSONEncoder):
             return o.isoformat(), True
         return o, False
 
-    def default(self, o):  # pylint: disable=E0202
+    def default(self, o):
         res, converted = self.try_convert(o)
         if converted:
             return res
@@ -200,14 +199,15 @@ class MlflowFailedTypeConversion(MlflowException):
     def __init__(self, col_name, col_type, ex):
         super().__init__(
             message=f"Data is not compatible with model signature. "
-            f"Failed to convert column {col_name} to type '{col_type}'. Error: '{ex}'",
+            f"Failed to convert column {col_name} to type '{col_type}'. Error: '{ex!r}'",
             error_code=BAD_REQUEST,
         )
 
 
 def cast_df_types_according_to_schema(pdf, schema):
-    from mlflow.types.schema import DataType
     import numpy as np
+
+    from mlflow.types.schema import DataType
 
     actual_cols = set(pdf.columns)
     if schema.has_input_names():
@@ -215,8 +215,8 @@ def cast_df_types_according_to_schema(pdf, schema):
     elif schema.is_tensor_spec() and len(schema.input_types()) == 1:
         dtype_list = zip(actual_cols, [schema.input_types()[0] for _ in actual_cols])
     else:
-        n = min(len(schema.input_types(), pdf.columns))
-        dtype_list = zip(pdf.columns[:n], schema.input_types[:n])
+        n = min(len(schema.input_types()), len(pdf.columns))
+        dtype_list = zip(pdf.columns[:n], schema.input_types()[:n])
 
     for col_name, col_type_spec in dtype_list:
         if isinstance(col_type_spec, DataType):
@@ -232,7 +232,7 @@ def cast_df_types_according_to_schema(pdf, schema):
                     )
                 elif col_type == np.dtype(bytes):
                     pdf[col_name] = pdf[col_name].map(lambda x: bytes(x, "utf8"))
-                elif schema.is_tensor_spec() and isinstance(pdf[col_name][0], list):
+                elif schema.is_tensor_spec() and isinstance(pdf[col_name].iloc[0], list):
                     # For dataframe with multidimensional column, it contains
                     # list type values, we cannot convert
                     # its type by `astype`, skip conversion.
@@ -375,9 +375,7 @@ def parse_tf_serving_input(inp_dict, schema=None):
                     raise MlflowException(
                         "Failed to parse input data. This model contains a tensor-based model"
                         " signature with input names, which suggests a dictionary input mapping"
-                        " input name to tensor, but an input of type {} was found.".format(
-                            type(input_data)
-                        )
+                        f" input name to tensor, but an input of type {type(input_data)} was found."
                     )
                 type_dict = dict(zip(schema.input_names(), schema.numpy_types()))
                 for col_name in input_data.keys():
@@ -389,7 +387,7 @@ def parse_tf_serving_input(inp_dict, schema=None):
                     raise MlflowException(
                         "Failed to parse input data. This model contains an un-named tensor-based"
                         " model signature which expects a single n-dimensional array as input,"
-                        " however, an input of type {} was found.".format(type(input_data))
+                        f" however, an input of type {type(input_data)} was found."
                     )
                 input_data = np.array(input_data, dtype=schema.numpy_types()[0])
         else:
@@ -454,8 +452,8 @@ def parse_tf_serving_input(inp_dict, schema=None):
 # Reference: https://stackoverflow.com/a/12126976
 class _CustomJsonEncoder(json.JSONEncoder):
     def default(self, o):
-        import pandas as pd
         import numpy as np
+        import pandas as pd
 
         if isinstance(o, (datetime.datetime, datetime.date, datetime.time, pd.Timestamp)):
             return o.isoformat()
@@ -475,7 +473,15 @@ def get_jsonable_input(name, data):
         raise MlflowException(f"Incompatible input type:{type(data)} for input {name}.")
 
 
-def dump_input_data(data, inputs_key="inputs"):
+def dump_input_data(data, inputs_key="inputs", params: Optional[Dict[str, Any]] = None):
+    """
+    :param data: Input data.
+    :param inputs_key: Key to represent data in the request payload.
+    :param params: Additional parameters to pass to the model for inference.
+
+                       .. Note:: Experimental: This parameter may change or be removed in a future
+                                               release without warning.
+    """
     import numpy as np
     import pandas as pd
 
@@ -485,8 +491,19 @@ def dump_input_data(data, inputs_key="inputs"):
         post_data = {inputs_key: {k: get_jsonable_input(k, v) for k, v in data}}
     elif isinstance(data, np.ndarray):
         post_data = {inputs_key: data.tolist()}
+    elif isinstance(data, list):
+        post_data = {inputs_key: data}
     else:
         post_data = data
+
+    if params is not None:
+        if not isinstance(params, dict):
+            raise MlflowException(
+                f"Params must be a dictionary. Got type '{type(params).__name__}'."
+            )
+        # if post_data is not dictionary, params should be included in post_data directly
+        if isinstance(post_data, dict):
+            post_data["params"] = params
 
     if not isinstance(post_data, str):
         post_data = json.dumps(post_data, cls=_CustomJsonEncoder)

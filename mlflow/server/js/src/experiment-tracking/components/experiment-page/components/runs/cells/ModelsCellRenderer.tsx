@@ -1,4 +1,5 @@
 import React from 'react';
+import { Tooltip } from '@databricks/design-system';
 import { TrimmedText } from '../../../../../../common/components/TrimmedText';
 import loggedModelSvg from '../../../../../../common/static/logged-model.svg';
 import registeredModelSvg from '../../../../../../common/static/registered-model.svg';
@@ -18,10 +19,18 @@ export const ModelsCellRenderer = React.memo((props: ModelsCellRendererProps) =>
   const models = Utils.mergeLoggedAndRegisteredModels(loggedModels, registeredModels);
 
   if (models && models.length) {
-    const modelToRender = models[0];
+    // TODO: type is wrongly inferred as boolean
+    const modelToRender = models[0] as any;
     let modelDiv;
     if (modelToRender.registeredModelName) {
       const { registeredModelName, registeredModelVersion } = modelToRender;
+      // eslint-disable-next-line prefer-const
+      let mvPageRoute = Utils.getIframeCorrectedRoute(
+        getModelVersionPageRoute(registeredModelName, registeredModelVersion),
+      );
+      // eslint-disable-next-line prefer-const
+      let displayName = registeredModelName;
+      const displayFullName = `${registeredModelName} version ${registeredModelVersion}`;
       modelDiv = (
         <>
           <img
@@ -30,17 +39,17 @@ export const ModelsCellRenderer = React.memo((props: ModelsCellRendererProps) =>
             title='Registered Model'
             src={registeredModelSvg}
           />
-          <a
-            href={Utils.getIframeCorrectedRoute(
-              getModelVersionPageRoute(registeredModelName, registeredModelVersion),
-            )}
-            className='registered-model-link'
-            target='_blank'
-            rel='noreferrer'
-          >
-            <TrimmedText text={registeredModelName} maxSize={10} className={'model-name'} />
-            {`/${registeredModelVersion}`}
-          </a>
+          <Tooltip title={displayFullName}>
+            <a
+              href={mvPageRoute}
+              className='registered-model-link'
+              target='_blank'
+              rel='noreferrer'
+            >
+              <TrimmedText text={displayName} maxSize={10} className={'model-name'} />
+              {`/${registeredModelVersion}`}
+            </a>
+          </Tooltip>
         </>
       );
     } else if (modelToRender.flavors) {

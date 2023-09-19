@@ -1,48 +1,51 @@
+import contextlib
+import doctest
 import functools
 import inspect
-from unittest import mock
+import json
 import os
+import pickle
+import re
+from unittest import mock
+
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import pytest
-import re
-import contextlib
-from packaging.version import Version
-
 import sklearn
 import sklearn.base
 import sklearn.cluster
 import sklearn.datasets
-import sklearn.pipeline
 import sklearn.model_selection
+import sklearn.pipeline
+from packaging.version import Version
+from scipy.sparse import csc_matrix, csr_matrix
 from scipy.stats import uniform
-from scipy.sparse import csr_matrix, csc_matrix
 
-from mlflow.exceptions import MlflowException
-from mlflow.models import Model
-from mlflow.models.signature import infer_signature
-from mlflow.models.utils import _read_example
 import mlflow.sklearn
+from mlflow import MlflowClient
 from mlflow.entities import RunStatus
+from mlflow.exceptions import MlflowException
+from mlflow.models import Model, infer_signature
+from mlflow.models.utils import _read_example
 from mlflow.sklearn.utils import (
+    _get_arg_names,
+    _is_estimator_html_repr_supported,
     _is_metric_supported,
     _is_plotting_supported,
-    _get_arg_names,
     _log_child_runs_info,
     _log_estimator_content,
-    _is_estimator_html_repr_supported,
 )
+from mlflow.types.utils import _infer_schema
 from mlflow.utils import _truncate_dict
 from mlflow.utils.autologging_utils import MlflowAutologgingQueueingClient
 from mlflow.utils.mlflow_tags import MLFLOW_AUTOLOGGING
 from mlflow.utils.validation import (
-    MAX_PARAMS_TAGS_PER_BATCH,
+    MAX_ENTITY_KEY_LENGTH,
     MAX_METRICS_PER_BATCH,
     MAX_PARAM_VAL_LENGTH,
-    MAX_ENTITY_KEY_LENGTH,
+    MAX_PARAMS_TAGS_PER_BATCH,
 )
-from mlflow import MlflowClient
 
 FIT_FUNC_NAMES = ["fit", "fit_transform", "fit_predict"]
 TRAINING_SCORE = "training_score"
@@ -182,6 +185,16 @@ def test_autolog_does_not_terminate_active_run():
     mlflow.end_run()
 
 
+def test_extra_tags_sklearn_autolog():
+    mlflow.sklearn.autolog(extra_tags={"test_tag": "sklearn_autolog"})
+    sklearn.cluster.KMeans().fit(*get_iris())
+    assert mlflow.active_run() is None
+
+    run = mlflow.last_active_run()
+    assert run.data.tags["test_tag"] == "sklearn_autolog"
+    assert run.data.tags[mlflow.utils.mlflow_tags.MLFLOW_AUTOLOGGING] == "sklearn"
+
+
 def test_estimator(fit_func_name):
     mlflow.sklearn.autolog()
 
@@ -254,9 +267,9 @@ def test_classifier_binary():
     if _is_plotting_supported():
         plot_names.extend(
             [
-                "{}.png".format("training_confusion_matrix"),
-                "{}.png".format("training_roc_curve"),
-                "{}.png".format("training_precision_recall_curve"),
+                "training_confusion_matrix.png",
+                "training_roc_curve.png",
+                "training_precision_recall_curve.png",
             ]
         )
 
@@ -315,7 +328,7 @@ def test_classifier_multi_class():
 
     plot_names = []
     if _is_plotting_supported():
-        plot_names = ["{}.png".format("training_confusion_matrix")]
+        plot_names = ["training_confusion_matrix.png"]
 
     assert all(x in artifacts for x in plot_names)
 
@@ -993,7 +1006,7 @@ def test_autolog_does_not_throw_when_failing_to_sample_X():
 
     # ensure throwing_X throws when sliced
     with pytest.raises(IndexError, match="DO NOT SLICE ME"):
-        _ = throwing_X[:5]
+        throwing_X[:5]
 
     mlflow.sklearn.autolog()
     model = sklearn.linear_model.LinearRegression()
@@ -1003,7 +1016,7 @@ def test_autolog_does_not_throw_when_failing_to_sample_X():
 
     model_conf = get_model_conf(run.info.artifact_uri)
 
-    mock_warning.assert_called_once()
+    assert mock_warning.call_count == 2
     mock_warning.call_args[0][0].endswith("DO NOT SLICE ME")
     assert "signature" not in model_conf.to_dict()
     assert "saved_input_example_info" not in model_conf.to_dict()
@@ -1057,6 +1070,25 @@ def test_autolog_does_not_throw_when_infer_signature_fails():
     assert "signature" not in model_conf.to_dict()
 
 
+def test_autolog_does_not_warn_when_model_has_transform_function():
+    X, y = get_iris()
+
+    mlflow.sklearn.autolog(log_input_examples=True, log_model_signatures=True)
+    with mlflow.start_run() as run, mock.patch("mlflow.sklearn._logger.warning") as mock_warning:
+        estimators = [
+            ("std_scaler", sklearn.preprocessing.StandardScaler()),
+        ]
+        model = sklearn.pipeline.Pipeline(estimators)
+        model.fit(X, y)
+
+    # Warning not called
+    msg = "Failed to infer model signature:"
+    assert all(msg not in c[0] for c in mock_warning.call_args_list)
+
+    model_conf = get_model_conf(run.info.artifact_uri)
+    assert "signature" in model_conf.to_dict()
+
+
 @pytest.mark.parametrize("log_input_examples", [True, False])
 @pytest.mark.parametrize("log_model_signatures", [True, False])
 def test_autolog_configuration_options(log_input_examples, log_model_signatures):
@@ -1087,6 +1119,105 @@ def test_sklearn_autolog_log_models_configuration(log_models):
     assert (MODEL_DIR in artifacts) == log_models
 
 
+@pytest.mark.parametrize("log_datasets", [True, False])
+def test_sklearn_autolog_log_datasets_configuration(log_datasets):
+    X, y = get_iris()
+
+    with mlflow.start_run() as run:
+        mlflow.sklearn.autolog(log_datasets=log_datasets)
+        model = sklearn.linear_model.LinearRegression()
+        model.fit(X, y)
+
+    run_id = run.info.run_id
+    client = MlflowClient()
+    dataset_inputs = client.get_run(run_id).inputs.dataset_inputs
+    if log_datasets:
+        assert len(dataset_inputs) == 1
+        feature_schema = _infer_schema(X)
+        target_schema = _infer_schema(y)
+        assert dataset_inputs[0].dataset.schema == json.dumps(
+            {
+                "mlflow_tensorspec": {
+                    "features": feature_schema.to_json(),
+                    "targets": target_schema.to_json(),
+                }
+            }
+        )
+    else:
+        assert len(dataset_inputs) == 0
+
+
+def test_sklearn_autolog_log_datasets_with_predict():
+    X, y = get_iris()
+
+    with mlflow.start_run() as run:
+        mlflow.sklearn.autolog(log_datasets=True)
+        model = sklearn.linear_model.LinearRegression()
+        model.fit(X, y)
+        model.predict(X)
+
+    run_id = run.info.run_id
+    client = MlflowClient()
+    dataset_inputs = client.get_run(run_id).inputs.dataset_inputs
+
+    assert len(dataset_inputs) == 2
+    assert dataset_inputs[0].tags[0].value == "train"
+    feature_schema = _infer_schema(X)
+    target_schema = _infer_schema(y)
+    assert dataset_inputs[0].dataset.schema == json.dumps(
+        {
+            "mlflow_tensorspec": {
+                "features": feature_schema.to_json(),
+                "targets": target_schema.to_json(),
+            }
+        }
+    )
+    assert dataset_inputs[1].tags[0].value == "eval"
+    assert dataset_inputs[1].dataset.schema == json.dumps(
+        {
+            "mlflow_tensorspec": {
+                "features": feature_schema.to_json(),
+                "targets": None,
+            }
+        }
+    )
+
+
+def test_sklearn_autolog_log_datasets_without_explicit_run():
+    X, y = get_iris()
+
+    mlflow.sklearn.autolog(log_datasets=True)
+    model = sklearn.linear_model.LinearRegression()
+    model.fit(X, y)
+    model.predict(X)
+
+    run_id = getattr(model, "_mlflow_run_id")
+    client = MlflowClient()
+    dataset_inputs = client.get_run(run_id).inputs.dataset_inputs
+
+    assert len(dataset_inputs) == 2
+    assert dataset_inputs[0].tags[0].value == "train"
+    feature_schema = _infer_schema(X)
+    target_schema = _infer_schema(y)
+    assert dataset_inputs[0].dataset.schema == json.dumps(
+        {
+            "mlflow_tensorspec": {
+                "features": feature_schema.to_json(),
+                "targets": target_schema.to_json(),
+            }
+        }
+    )
+    assert dataset_inputs[1].tags[0].value == "eval"
+    assert dataset_inputs[1].dataset.schema == json.dumps(
+        {
+            "mlflow_tensorspec": {
+                "features": feature_schema.to_json(),
+                "targets": None,
+            }
+        }
+    )
+
+
 def test_autolog_does_not_capture_runs_for_preprocessing_or_feature_manipulation_estimators():
     """
     Verifies that preprocessing and feature manipulation estimators, which represent data
@@ -1101,11 +1232,11 @@ def test_autolog_does_not_capture_runs_for_preprocessing_or_feature_manipulation
     client = MlflowClient()
     run_id = client.create_run(experiment_id=0).info.run_id
 
-    from sklearn.preprocessing import Normalizer, LabelEncoder, MinMaxScaler
-    from sklearn.impute import SimpleImputer
+    from sklearn.compose import ColumnTransformer
     from sklearn.feature_extraction.text import TfidfVectorizer
     from sklearn.feature_selection import VarianceThreshold
-    from sklearn.compose import ColumnTransformer
+    from sklearn.impute import SimpleImputer
+    from sklearn.preprocessing import LabelEncoder, MinMaxScaler, Normalizer
 
     with mlflow.start_run(run_id=run_id):
         Normalizer().fit_transform(np.random.random((5, 5)))
@@ -1203,7 +1334,10 @@ def test_autolog_disabled_on_sklearn_cross_val_api(cross_val_func_name):
 
     def assert_autolog_disabled_during_exec_cross_val_fun(run_):
         params, metrics, tags, artifacts = get_run_data(run_.info.run_id)
-        assert params == {} and metrics == {} and tags == {} and artifacts == []
+        assert params == {}
+        assert metrics == {}
+        assert tags == {}
+        assert artifacts == []
 
     diabetes = sklearn.datasets.load_diabetes()
     X = diabetes.data[:150]
@@ -1229,8 +1363,6 @@ def test_autolog_disabled_on_sklearn_cross_val_api(cross_val_func_name):
 
 
 def load_json_artifact(artifact_path):
-    import json
-
     fpath = mlflow.get_artifact_uri(artifact_path).replace("file://", "")
     with open(fpath) as f:
         return json.load(f)
@@ -1262,7 +1394,8 @@ def test_basic_post_training_metric_autologging():
         scorer1 = sklmetrics.make_scorer(sklmetrics.recall_score, average="micro")
         recall_score3_data2 = scorer1(model, eval2_X, eval2_y)
 
-        recall_score4_data2 = sklearn.metrics.SCORERS["recall_macro"](model, eval2_X, eval2_y)
+        scorer2 = sklmetrics.make_scorer(sklmetrics.recall_score, average="macro")
+        recall_score4_data2 = scorer2(model, eval2_X, eval2_y)
 
         eval1_X, eval1_y = eval1_X.copy(), eval1_y.copy()
         # In metric key, it will include dataset name as "eval1_X-2"
@@ -1290,9 +1423,7 @@ def test_basic_post_training_metric_autologging():
     }
 
     lor_score_3_cmd = "LogisticRegression.score(X=<ndarray>, y=<ndarray>)"
-    recall_score4_eval2_X_cmd = (
-        "recall_score(y_true=eval2_y, y_pred=y_pred, pos_label=None, average='macro')"
-    )
+    recall_score4_eval2_X_cmd = "recall_score(y_true=eval2_y, y_pred=y_pred, average='macro')"
     assert metric_info == {
         "LogisticRegression_score-2_eval1_X-2": "LogisticRegression.score(X=eval1_X, y=eval1_y)",
         "LogisticRegression_score-3_unknown_dataset": lor_score_3_cmd,
@@ -1320,7 +1451,6 @@ def test_basic_post_training_metric_autologging():
 
 @pytest.mark.parametrize("metric_name", mlflow.sklearn._get_metric_name_list())
 def test_run_metric_api_doc_example(metric_name):
-    import doctest
     from sklearn import metrics
 
     mlflow.sklearn.autolog()
@@ -1420,8 +1550,8 @@ def test_multi_model_interleaved_fit_and_post_train_metric_call():
     "scoring", [None, sklearn.metrics.make_scorer(sklearn.metrics.accuracy_score)]
 )
 def test_meta_estimator_disable_nested_post_training_autologging(scoring):
-    import sklearn.svm
     import sklearn.metrics
+    import sklearn.svm
 
     mlflow.sklearn.autolog()
 
@@ -1611,8 +1741,6 @@ class UnpicklableKmeans(sklearn.cluster.KMeans):
 
 
 def test_autolog_print_warning_if_custom_estimator_pickling_raise_error():
-    import pickle
-
     mlflow.sklearn.autolog()
 
     with mlflow.start_run() as run, mock.patch("mlflow.sklearn._logger.warning") as mock_warning:

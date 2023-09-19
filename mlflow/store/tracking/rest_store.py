@@ -1,37 +1,40 @@
-from mlflow.entities import Experiment, Run, RunInfo, Metric, ViewType
+from typing import List, Optional
+
+from mlflow.entities import DatasetInput, Experiment, Metric, Run, RunInfo, ViewType
 from mlflow.exceptions import MlflowException
 from mlflow.protos import databricks_pb2
 from mlflow.protos.service_pb2 import (
     CreateExperiment,
-    MlflowService,
-    GetExperiment,
-    GetRun,
-    SearchRuns,
-    SearchExperiments,
-    GetMetricHistory,
-    LogMetric,
-    LogParam,
-    SetTag,
-    UpdateRun,
     CreateRun,
-    DeleteRun,
-    RestoreRun,
     DeleteExperiment,
-    RestoreExperiment,
-    UpdateExperiment,
-    LogBatch,
-    LogModel,
+    DeleteRun,
     DeleteTag,
-    SetExperimentTag,
+    GetExperiment,
     GetExperimentByName,
+    GetMetricHistory,
+    GetRun,
+    LogBatch,
+    LogInputs,
+    LogMetric,
+    LogModel,
+    LogParam,
+    MlflowService,
+    RestoreExperiment,
+    RestoreRun,
+    SearchExperiments,
+    SearchRuns,
+    SetExperimentTag,
+    SetTag,
+    UpdateExperiment,
+    UpdateRun,
 )
-from mlflow.store.tracking.abstract_store import AbstractStore
 from mlflow.store.entities.paged_list import PagedList
+from mlflow.store.tracking.abstract_store import AbstractStore
 from mlflow.utils.proto_json_utils import message_to_json
 from mlflow.utils.rest_utils import (
+    _REST_API_PATH_PREFIX,
     call_endpoint,
     extract_api_info_for_service,
-    _REST_API_PATH_PREFIX,
 )
 
 _METHOD_TO_INFO = extract_api_info_for_service(MlflowService, _REST_API_PATH_PREFIX)
@@ -173,8 +176,7 @@ class RestStore(AbstractStore):
             )
         )
         response_proto = self._call_endpoint(CreateRun, req_body)
-        run = Run.from_proto(response_proto.run)
-        return run
+        return Run.from_proto(response_proto.run)
 
     def log_metric(self, run_id, metric):
         """
@@ -323,3 +325,17 @@ class RestStore(AbstractStore):
     def record_logged_model(self, run_id, mlflow_model):
         req_body = message_to_json(LogModel(run_id=run_id, model_json=mlflow_model.to_json()))
         self._call_endpoint(LogModel, req_body)
+
+    def log_inputs(self, run_id: str, datasets: Optional[List[DatasetInput]] = None):
+        """
+        Log inputs, such as datasets, to the specified run.
+
+        :param run_id: String id for the run
+        :param datasets: List of :py:class:`mlflow.entities.DatasetInput` instances to log
+                         as inputs to the run.
+
+        :return: None.
+        """
+        datasets_protos = [dataset.to_proto() for dataset in datasets]
+        req_body = message_to_json(LogInputs(run_id=run_id, datasets=datasets_protos))
+        self._call_endpoint(LogInputs, req_body)

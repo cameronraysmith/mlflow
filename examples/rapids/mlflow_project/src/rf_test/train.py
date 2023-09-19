@@ -3,14 +3,14 @@
 import argparse
 from functools import partial
 
-import mlflow
-import mlflow.sklearn
-
+from cuml.ensemble import RandomForestClassifier
 from cuml.metrics.accuracy import accuracy_score
 from cuml.preprocessing.model_selection import train_test_split
-from cuml.ensemble import RandomForestClassifier
+from hyperopt import STATUS_OK, Trials, fmin, hp, tpe
 
-from hyperopt import fmin, tpe, hp, Trials, STATUS_OK
+import mlflow
+import mlflow.sklearn
+from mlflow.models import infer_signature
 
 
 def load_data(fpath):
@@ -58,7 +58,10 @@ def _train(params, fpath, hyperopt=False):
 
     mlflow.log_metric("accuracy", acc)
 
-    mlflow.sklearn.log_model(mod, "saved_models")
+    predictions = mod.predict(X_train)
+    signature = infer_signature(X_train, predictions)
+
+    mlflow.sklearn.log_model(mod, "saved_models", signature=signature)
 
     if not hyperopt:
         return mod

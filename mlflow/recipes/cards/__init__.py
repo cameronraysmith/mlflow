@@ -1,19 +1,20 @@
 from __future__ import annotations
 
-import re
 import base64
 import html
+import logging
 import os
 import pathlib
-import logging
+import pickle
 import random
+import re
 import string
 from io import StringIO
 from typing import Union
 
 from packaging.version import Version
 
-from mlflow.exceptions import MlflowException, INVALID_PARAMETER_VALUE
+from mlflow.exceptions import INVALID_PARAMETER_VALUE, MlflowException
 
 CARD_PICKLE_NAME = "card.pkl"
 CARD_HTML_NAME = "card.html"
@@ -211,8 +212,6 @@ class BaseCard:
         if os.path.isdir(path):
             path = os.path.join(path, CARD_PICKLE_NAME)
         with open(path, "wb") as out:
-            import pickle
-
             pickle.dump(self, out)
 
     @staticmethod
@@ -220,8 +219,6 @@ class BaseCard:
         if os.path.isdir(path):
             path = os.path.join(path, CARD_PICKLE_NAME)
         with open(path, "rb") as f:
-            import pickle
-
             return pickle.load(f)
 
     @staticmethod

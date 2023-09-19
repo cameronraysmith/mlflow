@@ -2,6 +2,7 @@
 This module defines environment variables used in MLflow.
 """
 import os
+from pathlib import Path
 
 
 class _EnvironmentVariable:
@@ -15,20 +16,28 @@ class _EnvironmentVariable:
         self.default = default
 
     @property
-    def is_defined(self):
+    def defined(self):
         return self.name in os.environ
+
+    def get_raw(self):
+        return os.getenv(self.name)
+
+    def set(self, value):
+        os.environ[self.name] = value
+
+    def unset(self):
+        os.environ.pop(self.name, None)
 
     def get(self):
         """
         Reads the value of the environment variable if it exists and converts it to the desired
         type. Otherwise, returns the default value.
         """
-        val = os.getenv(self.name)
-        if val:
+        if (val := self.get_raw()) is not None:
             try:
                 return self.type(val)
             except Exception as e:
-                raise ValueError(f"Failed to convert {val} to {self.type} for {self.name}: {e}")
+                raise ValueError(f"Failed to convert {val!r} to {self.type} for {self.name}: {e}")
         return self.default
 
     def __str__(self):
@@ -36,6 +45,9 @@ class _EnvironmentVariable:
 
     def __repr__(self):
         return repr(self.name)
+
+    def __format__(self, format_spec: str) -> str:
+        return self.name.__format__(format_spec)
 
 
 class _BooleanEnvironmentVariable(_EnvironmentVariable):
@@ -51,7 +63,7 @@ class _BooleanEnvironmentVariable(_EnvironmentVariable):
         super().__init__(name, bool, default)
 
     def get(self):
-        if not self.is_defined:
+        if not self.defined:
             return self.default
 
         val = os.getenv(self.name)
@@ -63,6 +75,14 @@ class _BooleanEnvironmentVariable(_EnvironmentVariable):
             )
         return lowercased in ["true", "1"]
 
+
+#: Specifies the tracking URI.
+#: (default: ``None``)
+MLFLOW_TRACKING_URI = _EnvironmentVariable("MLFLOW_TRACKING_URI", str, None)
+
+#: Specifies the registry URI.
+#: (default: ``None``)
+MLFLOW_REGISTRY_URI = _EnvironmentVariable("MLFLOW_REGISTRY_URI", str, None)
 
 #: Specifies the ``dfs_tmpdir`` parameter to use for ``mlflow.spark.save_model``,
 #: ``mlflow.spark.log_model`` and ``mlflow.spark.load_model``. See
@@ -198,7 +218,210 @@ MLFLOW_ARTIFACT_UPLOAD_DOWNLOAD_TIMEOUT = _EnvironmentVariable(
 #: Specifies the device intended for use in the predict function - can be used
 #: to override behavior where the GPU is used by default when available by
 #: setting this environment variable to be ``cpu``. Currently, this
-#: variable is only supported for the MLflow PyTorch flavor.
+#: variable is only supported for the MLflow PyTorch and HuggingFace flavors.
+#: For the HuggingFace flavor, note that device must be parseable as an integer.
 MLFLOW_DEFAULT_PREDICTION_DEVICE = _EnvironmentVariable(
     "MLFLOW_DEFAULT_PREDICTION_DEVICE", str, None
 )
+
+#: Specifies to Huggingface whether to use the automatic device placement logic of
+# HuggingFace accelerate. If it's set to false, the low_cpu_mem_usage flag will not be
+# set to True and device_map will not be set to "auto".
+MLFLOW_HUGGINGFACE_DISABLE_ACCELERATE_FEATURES = _BooleanEnvironmentVariable(
+    "MLFLOW_DISABLE_HUGGINGFACE_ACCELERATE_FEATURES", False
+)
+
+#: Specifies to Huggingface whether to use the automatic device placement logic of
+# HuggingFace accelerate. If it's set to false, the low_cpu_mem_usage flag will not be
+# set to True and device_map will not be set to "auto".
+MLFLOW_HUGGINGFACE_USE_DEVICE_MAP = _BooleanEnvironmentVariable(
+    "MLFLOW_HUGGINGFACE_USE_DEVICE_MAP", True
+)
+
+#: Specifies to Huggingface to use the automatic device placement logic of HuggingFace accelerate.
+#: This can be set to values supported by the version of HuggingFace Accelerate being installed.
+MLFLOW_HUGGINGFACE_DEVICE_MAP_STRATEGY = _EnvironmentVariable(
+    "MLFLOW_HUGGINGFACE_DEVICE_MAP_STRATEGY", str, "auto"
+)
+
+#: Specifies to Huggingface to use the low_cpu_mem_usage flag powered by HuggingFace accelerate.
+#: If it's set to false, the low_cpu_mem_usage flag will be set to False.
+MLFLOW_HUGGINGFACE_USE_LOW_CPU_MEM_USAGE = _BooleanEnvironmentVariable(
+    "MLFLOW_HUGGINGFACE_USE_LOW_CPU_MEM_USAGE", True
+)
+
+#: Specifies the max_shard_size to use when mlflow transformers flavor saves the model checkpoint.
+#: This can be set to override the 500MB default.
+MLFLOW_HUGGINGFACE_MODEL_MAX_SHARD_SIZE = _EnvironmentVariable(
+    "MLFLOW_HUGGINGFACE_MODEL_MAX_SHARD_SIZE", str, "500MB"
+)
+
+#: Specifies whether or not to allow using a file URI as a model version source.
+#: Please be aware that setting this environment variable to True is potentially risky
+#: because it can allow access to arbitrary files on the specified filesystem
+#: (default: ``False``).
+MLFLOW_ALLOW_FILE_URI_AS_MODEL_VERSION_SOURCE = _BooleanEnvironmentVariable(
+    "MLFLOW_ALLOW_FILE_URI_AS_MODEL_VERSION_SOURCE", False
+)
+
+
+#: Specifies the name of the Databricks secret scope to use for storing OpenAI API keys.
+MLFLOW_OPENAI_SECRET_SCOPE = _EnvironmentVariable("MLFLOW_OPENAI_SECRET_SCOPE", str, None)
+
+#: Specifier whether or not to retry OpenAI API calls.
+MLFLOW_OPENAI_RETRIES_ENABLED = _BooleanEnvironmentVariable("MLFLOW_OPENAI_RETRIES_ENABLED", True)
+
+#: (Experimental, may be changed or removed)
+#: Specifies the download options to be used by pip wheel when `add_libraries_to_model` is used to
+#: create and log model dependencies as model artifacts. The default behavior only uses dependency
+#: binaries and no source packages.
+#: (default: ``--only-binary=:all:``).
+MLFLOW_WHEELED_MODEL_PIP_DOWNLOAD_OPTIONS = _EnvironmentVariable(
+    "MLFLOW_WHEELED_MODEL_PIP_DOWNLOAD_OPTIONS", str, "--only-binary=:all:"
+)
+
+# Specifies whether or not to use multipart download when downloading a large file on Databricks.
+MLFLOW_ENABLE_MULTIPART_DOWNLOAD = _BooleanEnvironmentVariable(
+    "MLFLOW_ENABLE_MULTIPART_DOWNLOAD", True
+)
+
+# Specifies whether or not to use multipart upload when uploading large artifacts.
+MLFLOW_ENABLE_MULTIPART_UPLOAD = _BooleanEnvironmentVariable("MLFLOW_ENABLE_MULTIPART_UPLOAD", True)
+
+#: Private environment variable that's set to ``True`` while running tests.
+_MLFLOW_TESTING = _BooleanEnvironmentVariable("MLFLOW_TESTING", False)
+
+#: Specifies the username used to authenticate with a tracking server.
+#: (default: ``None``)
+MLFLOW_TRACKING_USERNAME = _EnvironmentVariable("MLFLOW_TRACKING_USERNAME", str, None)
+
+#: Specifies the password used to authenticate with a tracking server.
+#: (default: ``None``)
+MLFLOW_TRACKING_PASSWORD = _EnvironmentVariable("MLFLOW_TRACKING_PASSWORD", str, None)
+
+#: Specifies and takes precedence for setting the basic/bearer auth on http requests.
+#: (default: ``None``)
+MLFLOW_TRACKING_TOKEN = _EnvironmentVariable("MLFLOW_TRACKING_TOKEN", str, None)
+
+#: Specifies whether to verify TLS connection in ``requests.request`` function,
+#: see https://requests.readthedocs.io/en/master/api/
+#: (default: ``False``).
+MLFLOW_TRACKING_INSECURE_TLS = _BooleanEnvironmentVariable("MLFLOW_TRACKING_INSECURE_TLS", False)
+
+#: Sets the ``verify`` param in ``requests.request`` function,
+#: see https://requests.readthedocs.io/en/master/api/
+#: (default: ``None``)
+MLFLOW_TRACKING_SERVER_CERT_PATH = _EnvironmentVariable(
+    "MLFLOW_TRACKING_SERVER_CERT_PATH", str, None
+)
+
+#: Sets the ``cert`` param in ``requests.request`` function,
+#: see https://requests.readthedocs.io/en/master/api/
+#: (default: ``None``)
+MLFLOW_TRACKING_CLIENT_CERT_PATH = _EnvironmentVariable(
+    "MLFLOW_TRACKING_CLIENT_CERT_PATH", str, None
+)
+
+#: Specified the ID of the run to log data to.
+#: (default: ``None``)
+MLFLOW_RUN_ID = _EnvironmentVariable("MLFLOW_RUN_ID", str, None)
+
+#: Specifies the default root directory for tracking `FileStore`.
+#: (default: ``None``)
+MLFLOW_TRACKING_DIR = _EnvironmentVariable("MLFLOW_TRACKING_DIR", str, None)
+
+#: Specifies the default root directory for registry `FileStore`.
+#: (default: ``None``)
+MLFLOW_REGISTRY_DIR = _EnvironmentVariable("MLFLOW_REGISTRY_DIR", str, None)
+
+#: Specifies the default experiment ID to create run to.
+#: (default: ``None``)
+MLFLOW_EXPERIMENT_ID = _EnvironmentVariable("MLFLOW_EXPERIMENT_ID", str, None)
+
+#: Specifies the default experiment name to create run to.
+#: (default: ``None``)
+MLFLOW_EXPERIMENT_NAME = _EnvironmentVariable("MLFLOW_EXPERIMENT_NAME", str, None)
+
+#: Specified the path to the configuration file for MLflow Authentication.
+#: (default: ``None``)
+MLFLOW_AUTH_CONFIG_PATH = _EnvironmentVariable("MLFLOW_AUTH_CONFIG_PATH", str, None)
+
+#: Specifies the root directory to create Python virtual environments in.
+#: (default: ``~/.mlflow/envs``)
+MLFLOW_ENV_ROOT = _EnvironmentVariable(
+    "MLFLOW_ENV_ROOT", str, str(Path.home().joinpath(".mlflow", "envs"))
+)
+
+#: Specifies whether or not to use DBFS FUSE mount to store artifacts on Databricks
+#: (default: ``False``)
+MLFLOW_ENABLE_DBFS_FUSE_ARTIFACT_REPO = _BooleanEnvironmentVariable(
+    "MLFLOW_ENABLE_DBFS_FUSE_ARTIFACT_REPO", True
+)
+
+#: Private environment variable that should be set to ``True`` when running autologging tests.
+#: (default: ``False``)
+_MLFLOW_AUTOLOGGING_TESTING = _BooleanEnvironmentVariable("MLFLOW_AUTOLOGGING_TESTING", False)
+
+#: (Experimental, may be changed or removed)
+#: Specifies the uri of a Mlflow Gateway Server instance to be used with the Gateway Client APIs
+#: (default: ``None``)
+MLFLOW_GATEWAY_URI = _EnvironmentVariable("MLFLOW_GATEWAY_URI", str, None)
+
+
+#: Specifies the path of the config file for MLflow AI Gateway.
+#: (default: ``None``)
+MLFLOW_GATEWAY_CONFIG = _EnvironmentVariable("MLFLOW_GATEWAY_CONFIG", str, None)
+
+#: Specifies whether to display the progress bar when uploading/downloading artifacts.
+#: (default: ``True``)
+MLFLOW_ENABLE_ARTIFACTS_PROGRESS_BAR = _BooleanEnvironmentVariable(
+    "MLFLOW_ENABLE_ARTIFACTS_PROGRESS_BAR", True
+)
+
+#: Specifies the conda home directory to use.
+#: (default: ``conda``)
+MLFLOW_CONDA_HOME = _EnvironmentVariable("MLFLOW_CONDA_HOME", str, None)
+
+#: Specifies the name of the command to use when creating the environments.
+#: For example, let's say we want to use mamba (https://github.com/mamba-org/mamba)
+#: instead of conda to create environments.
+#: Then: > conda install mamba -n base -c conda-forge
+#: If not set, use the same as conda_path
+#: (default: ``conda``)
+MLFLOW_CONDA_CREATE_ENV_CMD = _EnvironmentVariable("MLFLOW_CONDA_CREATE_ENV_CMD", str, "conda")
+
+#: Specifies the execution directory for recipes.
+#: (default: ``None``)
+MLFLOW_RECIPES_EXECUTION_DIRECTORY = _EnvironmentVariable(
+    "MLFLOW_RECIPES_EXECUTION_DIRECTORY", str, None
+)
+
+#: Specifies the target step to execute for recipes.
+#: (default: ``None``)
+MLFLOW_RECIPES_EXECUTION_TARGET_STEP_NAME = _EnvironmentVariable(
+    "MLFLOW_RECIPES_EXECUTION_TARGET_STEP_NAME", str, None
+)
+
+#: Specifies the flavor to serve in the scoring server.
+#: (default ``None``)
+MLFLOW_DEPLOYMENT_FLAVOR_NAME = _EnvironmentVariable("MLFLOW_DEPLOYMENT_FLAVOR_NAME", str, None)
+
+#: Specifies the profile to use for recipes.
+#: (default: ``None``)
+MLFLOW_RECIPES_PROFILE = _EnvironmentVariable("MLFLOW_RECIPES_PROFILE", str, None)
+
+#: Specifies the MLflow Run context
+#: (default: ``None``)
+MLFLOW_RUN_CONTEXT = _EnvironmentVariable("MLFLOW_RUN_CONTEXT", str, None)
+
+#: Specifies the URL of the ECR-hosted Docker image a model is deployed into for SageMaker.
+# (default: ``None``)
+MLFLOW_SAGEMAKER_DEPLOY_IMG_URL = _EnvironmentVariable("MLFLOW_SAGEMAKER_DEPLOY_IMG_URL", str, None)
+
+#: Specifies whether to disable creating a new conda environment for `mlflow models build-docker`.
+#: (default: ``False``)
+MLFLOW_DISABLE_ENV_CREATION = _BooleanEnvironmentVariable("MLFLOW_DISABLE_ENV_CREATION", False)
+
+#: Specifies the timeout value for downloading chunks of mlflow artifacts.
+#: (default: ``300``)
+MLFLOW_DOWNLOAD_CHUNK_TIMEOUT = _EnvironmentVariable("MLFLOW_DOWNLOAD_CHUNK_TIMEOUT", int, 300)

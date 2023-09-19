@@ -1,30 +1,39 @@
-from datetime import datetime
 import json
 import logging
-import warnings
-
-import yaml
 import os
 import uuid
+import warnings
+from datetime import datetime
+from typing import Any, Callable, Dict, Optional, Union
 
-from typing import Any, Dict, Optional, Union, Callable
+import yaml
 
 import mlflow
 from mlflow.artifacts import download_artifacts
 from mlflow.exceptions import MlflowException
 from mlflow.tracking._model_registry import DEFAULT_AWAIT_MAX_SLEEP_SECONDS
+from mlflow.tracking._tracking_service.utils import _resolve_tracking_uri
 from mlflow.utils.annotations import experimental
-from mlflow.utils.file_utils import TempDir
 from mlflow.utils.databricks_utils import get_databricks_runtime
+from mlflow.utils.file_utils import TempDir
+from mlflow.utils.uri import get_uri_scheme
 
 _logger = logging.getLogger(__name__)
 
 # NOTE: The MLMODEL_FILE_NAME constant is considered @developer_stable
 MLMODEL_FILE_NAME = "MLmodel"
+_DATABRICKS_FS_LOADER_MODULE = "databricks.feature_store.mlflow_model"
 _LOG_MODEL_METADATA_WARNING_TEMPLATE = (
     "Logging model metadata to the tracking server has failed. The model artifacts "
     "have been logged successfully under %s. Set logging level to DEBUG via "
     '`logging.getLogger("mlflow").setLevel(logging.DEBUG)` to see the full traceback.'
+)
+_LOG_MODEL_MISSING_SIGNATURE_WARNING = (
+    "Model logged without a signature. Signatures will be required for upcoming model registry "
+    "features as they validate model inputs and denote the expected schema of model outputs. "
+    f"Please visit https://www.mlflow.org/docs/{mlflow.__version__.replace('.dev0', '')}/"
+    "models.html#set-signature-on-logged-model for instructions on setting a model signature on "
+    "your logged model."
 )
 # NOTE: The _MLFLOW_VERSION_KEY constant is considered @developer_stable
 _MLFLOW_VERSION_KEY = "mlflow_version"
@@ -209,14 +218,17 @@ class ModelInfo:
             from sklearn import datasets
             from sklearn.ensemble import RandomForestClassifier
             import mlflow
+            from mlflow.models import infer_signature
 
             with mlflow.start_run():
                 iris = datasets.load_iris()
                 clf = RandomForestClassifier()
                 clf.fit(iris.data, iris.target)
+                signature = infer_signature(iris.data, iris.target)
                 mlflow.sklearn.log_model(
                     clf,
                     "iris_rf",
+                    signature=signature,
                     registered_model_name="model-with-metadata",
                     metadata={"metadata_key": "metadata_value"},
                 )
@@ -285,6 +297,13 @@ class Model:
         """
         return self.signature.outputs if self.signature is not None else None
 
+    def get_params_schema(self):
+        """
+        Retrieves the parameters schema of the Model iff the model was saved with a schema
+        definition.
+        """
+        return getattr(self.signature, "params", None)
+
     def load_input_example(self, path: str):
         """
         Load the input example saved along a model. Returns None if there is no example metadata
@@ -328,14 +347,17 @@ class Model:
             from sklearn import datasets
             from sklearn.ensemble import RandomForestClassifier
             import mlflow
+            from mlflow.models import infer_signature
 
             with mlflow.start_run():
                 iris = datasets.load_iris()
                 clf = RandomForestClassifier()
                 clf.fit(iris.data, iris.target)
+                signature = infer_signature(iris.data, iris.target)
                 mlflow.sklearn.log_model(
                     clf,
                     "iris_rf",
+                    signature=signature,
                     registered_model_name="model-with-metadata",
                     metadata={"metadata_key": "metadata_value"},
                 )
@@ -372,8 +394,11 @@ class Model:
 
     @signature.setter
     def signature(self, value):
-        # pylint: disable=attribute-defined-outside-init
-        self._signature = value
+        # signature cannot be set to `False`, which is used in `log_model` and `save_model` calls
+        # to disable automatic signature inference
+        if value is not False:
+            # pylint: disable=attribute-defined-outside-init
+            self._signature = value
 
     @property
     def saved_input_example_info(self) -> Optional[Dict[str, Any]]:
@@ -396,7 +421,7 @@ class Model:
         return ModelInfo(
             artifact_path=self.artifact_path,
             flavors=self.flavors,
-            model_uri="runs:/{}/{}".format(self.run_id, self.artifact_path),
+            model_uri=f"runs:/{self.run_id}/{self.artifact_path}",
             model_uuid=self.model_uuid,
             run_id=self.run_id,
             saved_input_example_info=self.saved_input_example_info,
@@ -471,7 +496,7 @@ class Model:
     def from_dict(cls, model_dict):
         """Load a model from its YAML representation."""
 
-        from .signature import ModelSignature
+        from mlflow.models.signature import ModelSignature
 
         model_dict = model_dict.copy()
         if "signature" in model_dict and isinstance(model_dict["signature"], dict):
@@ -514,7 +539,7 @@ class Model:
 
                           .. code-block:: python
 
-                            from mlflow.models.signature import infer_signature
+                            from mlflow.models import infer_signature
 
                             train = df.drop_column("target_label")
                             signature = infer_signature(train, model.predict(train))
@@ -544,6 +569,13 @@ class Model:
             local_path = tmp.path("model")
             run_id = mlflow.tracking.fluent._get_or_start_run().info.run_id
             mlflow_model = cls(artifact_path=artifact_path, run_id=run_id, metadata=metadata)
+            tracking_uri = _resolve_tracking_uri()
+            if (
+                (tracking_uri == "databricks" or get_uri_scheme(tracking_uri) == "databricks")
+                and kwargs.get("signature") is None
+                and kwargs.get("input_example") is None
+            ):
+                _logger.warning(_LOG_MODEL_MISSING_SIGNATURE_WARNING)
             flavor.save_model(path=local_path, mlflow_model=mlflow_model, **kwargs)
             mlflow.tracking.fluent.log_artifacts(local_path, mlflow_model.artifact_path)
             try:
@@ -555,10 +587,11 @@ class Model:
                 _logger.debug("", exc_info=True)
             if registered_model_name is not None:
                 run_id = mlflow.tracking.fluent.active_run().info.run_id
-                mlflow.register_model(
-                    "runs:/{}/{}".format(run_id, mlflow_model.artifact_path),
+                mlflow.tracking._model_registry.fluent._register_model(
+                    f"runs:/{run_id}/{mlflow_model.artifact_path}",
                     registered_model_name,
                     await_registration_for=await_registration_for,
+                    local_model_path=local_path,
                 )
         return mlflow_model.get_model_info()
 
@@ -599,7 +632,7 @@ def get_model_info(model_uri: str) -> ModelInfo:
                 mlflow.log_params(params)
                 mlflow.sklearn.log_model(rfr, artifact_path="sklearn-model", signature=signature)
 
-            model_uri = "runs:/{}/sklearn-model".format(run.info.run_id)
+            model_uri = f"runs:/{run.info.run_id}/sklearn-model"
             # Get model info with model_uri
             model_info = mlflow.models.get_model_info(model_uri)
             # Get model signature directly

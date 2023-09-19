@@ -2,7 +2,7 @@ import { useState } from 'react';
 import type { ReactWrapper } from 'enzyme';
 import { IntlProvider } from 'react-intl';
 import { Provider } from 'react-redux';
-import { StaticRouter } from 'react-router-dom';
+import { MemoryRouter } from '../../../../../common/utils/RoutingUtils';
 import { applyMiddleware, compose, createStore } from 'redux';
 import promiseMiddleware from 'redux-promise-middleware';
 import { mountWithIntl } from '../../../../../common/utils/TestUtils';
@@ -10,11 +10,16 @@ import { EXPERIMENT_RUNS_MOCK_STORE } from '../../fixtures/experiment-runs.fixtu
 import { SearchExperimentRunsFacetsState } from '../../models/SearchExperimentRunsFacetsState';
 import { SearchExperimentRunsViewState } from '../../models/SearchExperimentRunsViewState';
 import { experimentRunsSelector } from '../../utils/experimentRuns.selector';
-import { GetExperimentRunsContextProvider } from '../../contexts/GetExperimentRunsContext';
 import {
   ExperimentViewRunsControlsActions,
   ExperimentViewRunsControlsActionsProps,
 } from './ExperimentViewRunsControlsActions';
+
+jest.mock('../../hooks/useFetchExperimentRuns', () => ({
+  useFetchExperimentRuns: jest.fn(() => ({
+    searchFacetsState: {},
+  })),
+}));
 
 jest.mock('./ExperimentViewRefreshButton', () => ({
   ExperimentViewRefreshButton: () => <div />,
@@ -51,7 +56,6 @@ const doMock = (additionalProps: Partial<ExperimentViewRunsControlsActionsProps>
 
     const props: ExperimentViewRunsControlsActionsProps = {
       runsData: MOCK_RUNS_DATA,
-      updateSearchFacets,
       searchFacetsState,
       viewState: DEFAULT_VIEW_STATE,
       ...additionalProps,
@@ -64,13 +68,11 @@ const doMock = (additionalProps: Partial<ExperimentViewRunsControlsActionsProps>
           compose(applyMiddleware(promiseMiddleware())),
         )}
       >
-        <StaticRouter location='/'>
-          <GetExperimentRunsContextProvider actions={{} as any}>
-            <IntlProvider locale='en'>
-              <ExperimentViewRunsControlsActions {...props} />
-            </IntlProvider>
-          </GetExperimentRunsContextProvider>
-        </StaticRouter>
+        <MemoryRouter>
+          <IntlProvider locale='en'>
+            <ExperimentViewRunsControlsActions {...props} />
+          </IntlProvider>
+        </MemoryRouter>
       </Provider>
     );
   };
@@ -81,6 +83,7 @@ const doMock = (additionalProps: Partial<ExperimentViewRunsControlsActionsProps>
   };
 };
 
+// @ts-expect-error TS(2709): Cannot use namespace 'ReactWrapper' as a type.
 export const getActionButtons = (wrapper: ReactWrapper) => {
   const deleteButton = wrapper.find("button[data-testid='runs-delete-button']");
   const compareButton = wrapper.find("button[data-testid='runs-compare-button']");
@@ -94,23 +97,15 @@ describe('ExperimentViewRunsControlsFilters', () => {
     expect(wrapper).toBeTruthy();
   });
 
-  test('should hide compare and delete buttons when no runs are selected', () => {
-    const { wrapper } = doMock();
-
-    const { deleteButton, compareButton, renameButton } = getActionButtons(wrapper);
-
-    // All buttons should be hidden
-    expect(deleteButton.length).toBe(0);
-    expect(compareButton.length).toBe(0);
-    expect(renameButton.length).toBe(0);
-  });
-
   test('should enable delete buttons when there is single row selected', () => {
     const { wrapper } = doMock({
       viewState: {
         runsSelected: { '123': true },
         hiddenChildRunsSelected: {},
         columnSelectorVisible: false,
+        previewPaneVisible: false,
+        artifactViewState: {},
+        viewMaximized: false,
       },
     });
 
@@ -133,6 +128,9 @@ describe('ExperimentViewRunsControlsFilters', () => {
         runsSelected: { '123': true, '321': true },
         hiddenChildRunsSelected: {},
         columnSelectorVisible: false,
+        previewPaneVisible: false,
+        artifactViewState: {},
+        viewMaximized: false,
       },
     });
 
@@ -155,6 +153,9 @@ describe('ExperimentViewRunsControlsFilters', () => {
         runsSelected: { '123': true },
         hiddenChildRunsSelected: {},
         columnSelectorVisible: false,
+        previewPaneVisible: false,
+        artifactViewState: {},
+        viewMaximized: false,
       },
     });
 
@@ -168,6 +169,9 @@ describe('ExperimentViewRunsControlsFilters', () => {
         runsSelected: { '123': true, '321': true },
         hiddenChildRunsSelected: {},
         columnSelectorVisible: false,
+        previewPaneVisible: false,
+        artifactViewState: {},
+        viewMaximized: false,
       },
     });
 

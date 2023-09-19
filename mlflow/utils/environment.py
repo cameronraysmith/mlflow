@@ -1,9 +1,11 @@
-import yaml
-import os
-import logging
-import re
 import hashlib
-from packaging.requirements import Requirement, InvalidRequirement
+import logging
+import os
+import re
+from collections import Counter
+
+import yaml
+from packaging.requirements import InvalidRequirement, Requirement
 from packaging.version import Version
 
 from mlflow.exceptions import MlflowException
@@ -11,11 +13,10 @@ from mlflow.protos.databricks_pb2 import INVALID_PARAMETER_VALUE
 from mlflow.utils import PYTHON_VERSION
 from mlflow.utils.process import _exec_cmd
 from mlflow.utils.requirements_utils import (
-    _parse_requirements,
     _infer_requirements,
+    _parse_requirements,
 )
 from mlflow.version import VERSION
-
 
 _logger = logging.getLogger(__name__)
 
@@ -84,7 +85,7 @@ class _PythonEnv:
     def _get_package_version(package_name):
         try:
             return __import__(package_name).__version__
-        except (ImportError, AttributeError):
+        except (ImportError, AttributeError, AssertionError):
             return None
 
     @staticmethod
@@ -460,13 +461,11 @@ def _generate_mlflow_version_pinning():
     the current installed minor version(i.e., 'mlflow<3,>=2.1')
     :return: string for MLflow dependency version
     """
-    mlflow_version = Version(VERSION)
-    current_major_version = mlflow_version.major
-    current_minor_version = mlflow_version.minor
-    range_version = (
-        f"mlflow<{current_major_version + 1},>={current_major_version}.{current_minor_version}"
-    )
-    return range_version
+    version = Version(VERSION)
+    # The version on master is always a micro-version ahead of the latest release and can't be
+    # installed from PyPI. We therefore subtract 1 from the micro version when running tests.
+    offset = -1 if version.is_devrelease else 0
+    return f"mlflow=={version.major}.{version.minor}.{version.micro + offset}"
 
 
 def _contains_mlflow_requirement(requirements):
@@ -503,6 +502,25 @@ def _process_pip_requirements(
     return conda_env, pip_reqs, constraints
 
 
+def _find_duplicate_requirements(requirements):
+    """
+    Checks if duplicate base package requirements are specified in any list of requirements
+    and returns the list of duplicate base package names.
+    Note that git urls and paths to local files are not being considered for duplication checking.
+    """
+    base_package_names = []
+
+    for package in requirements:
+        try:
+            base_package_names.append(Requirement(package).name)
+        except InvalidRequirement:
+            # Skip anything that's not a valid package requirement
+            continue
+
+    package_counts = Counter(base_package_names)
+    return [package for package, count in package_counts.items() if count > 1]
+
+
 def _process_conda_env(conda_env):
     """
     Processes `conda_env` passed to `mlflow.*.save_model` or `mlflow.*.log_model`, and returns
@@ -514,7 +532,7 @@ def _process_conda_env(conda_env):
     elif not isinstance(conda_env, dict):
         raise TypeError(
             "Expected a string path to a conda env yaml file or a `dict` representing a conda env, "
-            "but got `{}`".format(type(conda_env).__name__)
+            f"but got `{type(conda_env).__name__}`"
         )
 
     # User-specified `conda_env` may contain requirements/constraints file references

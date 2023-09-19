@@ -7,55 +7,58 @@ PyTorch (native) format
 :py:mod:`mlflow.pyfunc`
     Produced for use by generic pyfunc-based deployment tools and batch inference.
 """
+import atexit
 import importlib
 import logging
 import os
-import yaml
+import posixpath
+import shutil
 import warnings
+from functools import partial
+from typing import Any, Dict, Optional
 
 import numpy as np
 import pandas as pd
-from functools import partial
+import yaml
 from packaging.version import Version
-import posixpath
 
 import mlflow
-import shutil
 from mlflow import pyfunc
 from mlflow.environment_variables import MLFLOW_DEFAULT_PREDICTION_DEVICE
 from mlflow.exceptions import MlflowException
 from mlflow.ml_package_versions import _ML_PACKAGE_VERSIONS
 from mlflow.models import Model, ModelSignature
 from mlflow.models.model import MLMODEL_FILE_NAME
+from mlflow.models.signature import _infer_signature_from_input_example
 from mlflow.models.utils import ModelInputExample, _save_example
 from mlflow.protos.databricks_pb2 import RESOURCE_DOES_NOT_EXIST
 from mlflow.pytorch import pickle_module as mlflow_pytorch_pickle_module
+from mlflow.tracking._model_registry import DEFAULT_AWAIT_MAX_SLEEP_SECONDS
 from mlflow.tracking.artifact_utils import _download_artifact_from_uri
+from mlflow.utils.autologging_utils import autologging_integration, safe_patch
+from mlflow.utils.docstring_utils import LOG_MODEL_PARAM_DOCS, format_docstring
 from mlflow.utils.environment import (
-    _mlflow_conda_env,
-    _validate_env_arguments,
-    _process_pip_requirements,
-    _process_conda_env,
     _CONDA_ENV_FILE_NAME,
-    _REQUIREMENTS_FILE_NAME,
     _CONSTRAINTS_FILE_NAME,
     _PYTHON_ENV_FILE_NAME,
+    _REQUIREMENTS_FILE_NAME,
+    _mlflow_conda_env,
+    _process_conda_env,
+    _process_pip_requirements,
     _PythonEnv,
+    _validate_env_arguments,
 )
-from mlflow.utils.requirements_utils import _get_pinned_requirement
-from mlflow.utils.docstring_utils import format_docstring, LOG_MODEL_PARAM_DOCS
 from mlflow.utils.file_utils import (
     TempDir,
     write_to,
 )
 from mlflow.utils.model_utils import (
+    _add_code_from_conf_to_system_path,
     _get_flavor_configuration,
     _validate_and_copy_code_paths,
-    _add_code_from_conf_to_system_path,
     _validate_and_prepare_target_save_path,
 )
-from mlflow.tracking._model_registry import DEFAULT_AWAIT_MAX_SLEEP_SECONDS
-from mlflow.utils.autologging_utils import autologging_integration, safe_patch
+from mlflow.utils.requirements_utils import _get_pinned_requirement
 
 FLAVOR_NAME = "pytorch"
 
@@ -105,11 +108,11 @@ def get_default_conda_env():
 
         # Log PyTorch model
         with mlflow.start_run() as run:
-            mlflow.pytorch.log_model(model, "model")
+            mlflow.pytorch.log_model(model, "model", signature=signature)
 
         # Fetch the associated conda environment
         env = mlflow.pytorch.get_default_conda_env()
-        print("conda env: {}".format(env))
+        print(f"conda env: {env}")
 
     .. code-block:: text
         :caption: Output
@@ -181,28 +184,8 @@ def log_model(
     :param registered_model_name: If given, create a model version under
                                   ``registered_model_name``, also creating a registered model if one
                                   with the given name does not exist.
-
-    :param signature: :py:class:`ModelSignature <mlflow.models.ModelSignature>`
-                      describes model input and output :py:class:`Schema <mlflow.types.Schema>`.
-                      The model signature can be :py:func:`inferred <mlflow.models.infer_signature>`
-                      from datasets with valid model input (e.g. the training dataset with target
-                      column omitted) and valid model output (e.g. model predictions generated on
-                      the training dataset), for example:
-
-                      .. code-block:: python
-
-                        from mlflow.models.signature import infer_signature
-
-                        train = df.drop_column("target_label")
-                        predictions = ...  # compute model predictions
-                        signature = infer_signature(train, predictions)
-    :param input_example: Input example provides one or several instances of valid
-                          model input. The example can be used as a hint of what data to feed the
-                          model. The given example can be a Pandas DataFrame where the given
-                          example will be serialized to json using the Pandas split-oriented
-                          format, or a numpy array where the example will be serialized to json
-                          by converting it to a list. Bytes are base64-encoded.
-
+    :param signature: {{ signature }}
+    :param input_example: {{ input_example }}
     :param await_registration_for: Number of seconds to wait for the model version to finish
                             being created and is in ``READY`` status. By default, the function
                             waits for five minutes. Specify 0 or None to skip waiting.
@@ -248,36 +231,21 @@ def log_model(
 
         import numpy as np
         import torch
-        import mlflow.pytorch
-
-
-        class LinearNNModel(torch.nn.Module):
-            def __init__(self):
-                super().__init__()
-                self.linear = torch.nn.Linear(1, 1)  # One in and one out
-
-            def forward(self, x):
-                y_pred = self.linear(x)
-                return y_pred
-
-
-        def gen_data():
-            # Example linear model modified to use y = 2x
-            # from https://github.com/hunkim/PyTorchZeroToAll
-            # X training data, y labels
-            X = torch.arange(1.0, 25.0).view(-1, 1)
-            y = torch.from_numpy(np.array([x * 2 for x in X])).view(-1, 1)
-            return X, y
-
+        import mlflow
+        from mlflow import MlflowClient
+        from mlflow.models import infer_signature
 
         # Define model, loss, and optimizer
-        model = LinearNNModel()
+        model = nn.Linear(1, 1)
         criterion = torch.nn.MSELoss()
         optimizer = torch.optim.SGD(model.parameters(), lr=0.001)
 
+        # Create training data with relationship y = 2X
+        X = torch.arange(1.0, 26.0).reshape(-1, 1)
+        y = X * 2
+
         # Training loop
         epochs = 250
-        X, y = gen_data()
         for epoch in range(epochs):
             # Forward pass: Compute predicted y by passing X to the model
             y_pred = model(X)
@@ -290,6 +258,9 @@ def log_model(
             loss.backward()
             optimizer.step()
 
+        # Create model signature
+        signature = infer_signature(X.numpy(), model(X).detach().numpy())
+
         # Log the model
         with mlflow.start_run() as run:
             mlflow.pytorch.log_model(model, "model")
@@ -299,12 +270,12 @@ def log_model(
             mlflow.pytorch.log_model(scripted_pytorch_model, "scripted_model")
 
         # Fetch the logged model artifacts
-        print("run_id: {}".format(run.info.run_id))
+        print(f"run_id: {run.info.run_id}")
         for artifact_path in ["model/data", "scripted_model/data"]:
             artifacts = [
                 f.path for f in MlflowClient().list_artifacts(run.info.run_id, artifact_path)
             ]
-            print("artifacts: {}".format(artifacts))
+            print(f"artifacts: {artifacts}")
 
     .. code-block:: text
         :caption: Output
@@ -385,28 +356,8 @@ def save_model(
                           ``pytorch_model``. This is passed as the ``pickle_module`` parameter
                           to ``torch.save()``. By default, this module is also used to
                           deserialize ("unpickle") the PyTorch model at load time.
-
-    :param signature: :py:class:`ModelSignature <mlflow.models.ModelSignature>`
-                      describes model input and output :py:class:`Schema <mlflow.types.Schema>`.
-                      The model signature can be :py:func:`inferred <mlflow.models.infer_signature>`
-                      from datasets with valid model input (e.g. the training dataset with target
-                      column omitted) and valid model output (e.g. model predictions generated on
-                      the training dataset), for example:
-
-                      .. code-block:: python
-
-                        from mlflow.models.signature import infer_signature
-
-                        train = df.drop_column("target_label")
-                        predictions = ...  # compute model predictions
-                        signature = infer_signature(train, predictions)
-    :param input_example: Input example provides one or several instances of valid
-                          model input. The example can be used as a hint of what data to feed the
-                          model. The given example can be a Pandas DataFrame where the given
-                          example will be serialized to json using the Pandas split-oriented
-                          format, or a numpy array where the example will be serialized to json
-                          by converting it to a list. Bytes are base64-encoded.
-
+    :param signature: {{ signature }}
+    :param input_example: {{ input_example }}
     :param requirements_file:
 
         .. warning::
@@ -471,13 +422,13 @@ def save_model(
 
         # Load each saved model for inference
         for model_path in ["model", "scripted_model"]:
-            model_uri = "{}/{}".format(os.getcwd(), model_path)
+            model_uri = f"{os.getcwd()}/{model_path}"
             loaded_model = mlflow.pytorch.load_model(model_uri)
-            print("Loaded {}:".format(model_path))
+            print(f"Loaded {model_path}:")
             for x in [6.0, 8.0, 12.0, 30.0]:
                 X = torch.Tensor([[x]])
                 y_pred = loaded_model(X)
-                print("predict X: {}, y_pred: {:.2f}".format(x, y_pred.data.item()))
+                print(f"predict X: {x}, y_pred: {y_pred.data.item():.2f}")
             print("--")
 
     .. code-block:: text
@@ -506,9 +457,14 @@ def save_model(
     path = os.path.abspath(path)
     _validate_and_prepare_target_save_path(path)
 
+    if signature is None and input_example is not None:
+        wrapped_model = _PyTorchWrapper(pytorch_model)
+        signature = _infer_signature_from_input_example(input_example, wrapped_model)
+    elif signature is False:
+        signature = None
+
     if mlflow_model is None:
         mlflow_model = Model()
-
     if signature is not None:
         mlflow_model.signature = signature
     if input_example is not None:
@@ -721,15 +677,15 @@ def load_model(model_uri, dst_path=None, **kwargs):
 
         # Log the model
         with mlflow.start_run() as run:
-            mlflow.pytorch.log_model(model, "model")
+            mlflow.pytorch.log_model(model, "model", signature=signature)
 
         # Inference after loading the logged model
-        model_uri = "runs:/{}/model".format(run.info.run_id)
+        model_uri = f"runs:/{run.info.run_id}/model"
         loaded_model = mlflow.pytorch.load_model(model_uri)
         for x in [4.0, 6.0, 30.0]:
             X = torch.Tensor([[x]])
             y_pred = loaded_model(X)
-            print("predict X: {}, y_pred: {:.2f}".format(x, y_pred.data.item()))
+            print(f"predict X: {x}, y_pred: {y_pred.data.item():.2f}")
 
     .. code-block:: text
         :caption: Output
@@ -772,9 +728,19 @@ class _PyTorchWrapper:
     def __init__(self, pytorch_model):
         self.pytorch_model = pytorch_model
 
-    def predict(self, data, device=None):
+    def predict(self, data, params: Optional[Dict[str, Any]] = None):
+        """
+        :param data: Model input data.
+        :param params: Additional parameters to pass to the model for inference.
+
+                       .. Note:: Experimental: This parameter may change or be removed in a future
+                                               release without warning.
+
+        :return: Model predictions.
+        """
         import torch
 
+        device = params.get("device", None) if params else None
         # if CUDA is available, we use the default CUDA device.
         # To force inference to the CPU when the GPU is available, please set
         # MLFLOW_DEFAULT_PREDICTION_DEVICE to "cpu"
@@ -810,7 +776,7 @@ class _PyTorchWrapper:
             if not isinstance(preds, torch.Tensor):
                 raise TypeError(
                     "Expected PyTorch model to output a single output tensor, "
-                    "but got output of type '{}'".format(type(preds))
+                    f"but got output of type '{type(preds)}'"
                 )
             if isinstance(data, pd.DataFrame):
                 predicted = pd.DataFrame(preds.numpy())
@@ -922,11 +888,13 @@ def autolog(
     log_every_n_epoch=1,
     log_every_n_step=None,
     log_models=True,
+    log_datasets=True,
     disable=False,
     exclusive=False,
     disable_for_unsupported_versions=False,
     silent=False,
     registered_model_name=None,
+    extra_tags=None,
 ):  # pylint: disable=unused-argument
     """
     Enables (or disables) and configures autologging from `PyTorch Lightning
@@ -961,6 +929,8 @@ def autolog(
                        cause performance issues and is not recommended.
     :param log_models: If ``True``, trained models are logged as MLflow model artifacts.
                        If ``False``, trained models are not logged.
+    :param log_datasets: If ``True``, dataset information is logged to MLflow Tracking.
+                         If ``False``, dataset information is not logged.
     :param disable: If ``True``, disables the PyTorch Lightning autologging integration.
                     If ``False``, enables the PyTorch Lightning autologging integration.
     :param exclusive: If ``True``, autologged content is not logged to user-created fluent runs.
@@ -975,6 +945,7 @@ def autolog(
     :param registered_model_name: If given, each time a model is trained, it is registered as a
                                   new model version of the registered model with this name.
                                   The registered model is created if it does not already exist.
+    :param extra_tags: A dictionary of extra tags to set on each managed run created by autologging.
 
     .. code-block:: python
         :caption: Example
@@ -1028,11 +999,11 @@ def autolog(
         def print_auto_logged_info(r):
             tags = {k: v for k, v in r.data.tags.items() if not k.startswith("mlflow.")}
             artifacts = [f.path for f in MlflowClient().list_artifacts(r.info.run_id, "model")]
-            print("run_id: {}".format(r.info.run_id))
-            print("artifacts: {}".format(artifacts))
-            print("params: {}".format(r.data.params))
-            print("metrics: {}".format(r.data.metrics))
-            print("tags: {}".format(tags))
+            print(f"run_id: {r.info.run_id}")
+            print(f"artifacts: {artifacts}")
+            print(f"params: {r.data.params}")
+            print(f"metrics: {r.data.metrics}")
+            print(f"tags: {tags}")
 
 
         # Initialize our model
@@ -1081,8 +1052,6 @@ def autolog(
 
         PyTorch autologged MLflow entities
     """
-    import atexit
-
     try:
         import pytorch_lightning as pl
     except ImportError:
@@ -1090,7 +1059,20 @@ def autolog(
     else:
         from mlflow.pytorch._lightning_autolog import patched_fit
 
-        safe_patch(FLAVOR_NAME, pl.Trainer, "fit", patched_fit, manage_run=True)
+        safe_patch(
+            FLAVOR_NAME, pl.Trainer, "fit", patched_fit, manage_run=True, extra_tags=extra_tags
+        )
+
+    try:
+        import lightning as L
+    except ImportError:
+        pass
+    else:
+        from mlflow.pytorch._lightning_autolog import patched_fit
+
+        safe_patch(
+            FLAVOR_NAME, L.Trainer, "fit", patched_fit, manage_run=True, extra_tags=extra_tags
+        )
 
     try:
         import torch.utils.tensorboard.writer
@@ -1098,10 +1080,10 @@ def autolog(
         pass
     else:
         from mlflow.pytorch._pytorch_autolog import (
+            flush_metrics_queue,
             patched_add_event,
             patched_add_hparams,
             patched_add_summary,
-            _flush_queue,
         )
 
         safe_patch(
@@ -1110,6 +1092,7 @@ def autolog(
             "add_event",
             partial(patched_add_event, mlflow_log_every_n_step=log_every_n_step),
             manage_run=True,
+            extra_tags=extra_tags,
         )
         safe_patch(
             FLAVOR_NAME,
@@ -1117,6 +1100,7 @@ def autolog(
             "add_summary",
             patched_add_summary,
             manage_run=True,
+            extra_tags=extra_tags,
         )
         safe_patch(
             FLAVOR_NAME,
@@ -1124,9 +1108,10 @@ def autolog(
             "add_hparams",
             patched_add_hparams,
             manage_run=True,
+            extra_tags=extra_tags,
         )
 
-        atexit.register(_flush_queue)
+        atexit.register(flush_metrics_queue)
 
 
 if autolog.__doc__ is not None:

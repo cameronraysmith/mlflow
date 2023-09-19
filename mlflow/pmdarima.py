@@ -8,13 +8,60 @@ Pmdarima format
     Produced for use by generic pyfunc-based deployment tools and for batch auditing
     of historical forecasts.
 
+ .. code-block:: python
+    :caption: Example
+
+    import pandas as pd
+    import mlflow
+    import mlflow.pyfunc
+    import pmdarima
+    from pmdarima import auto_arima
+
+
+    # Define a custom model class
+    class PmdarimaWrapper(mlflow.pyfunc.PythonModel):
+        def load_context(self, context):
+            self.model = context.artifacts["model"]
+
+        def predict(self, context, model_input):
+            return self.model.predict(n_periods=model_input.shape[0])
+
+
+    # Specify locations of source data and the model artifact
+    SOURCE_DATA = "https://raw.githubusercontent.com/facebook/prophet/master/examples/example_retail_sales.csv"
+    ARTIFACT_PATH = "model"
+
+    # Read data and recode columns
+    sales_data = pd.read_csv(SOURCE_DATA)
+    sales_data.rename(columns={"y": "sales", "ds": "date"}, inplace=True)
+
+    # Split the data into train/test
+    train_size = int(0.8 * len(sales_data))
+    train, _ = sales_data[:train_size], sales_data[train_size:]
+
+    # Create the model
+    model = pmdarima.auto_arima(train["sales"], seasonal=True, m=12)
+
+    # Log the model
+    with mlflow.start_run():
+        wrapper = PmdarimaWrapper()
+        mlflow.pyfunc.log_model(
+            artifact_path="model",
+            python_model=wrapper,
+            artifacts={"model": mlflow.pyfunc.model_to_dict(model)},
+        )
+
+
 .. _Pmdarima:
     http://alkaline-ml.com/pmdarima/
 """
-import os
+
 import logging
+import os
 import pickle
 import warnings
+from typing import Any, Dict, Optional
+
 import pandas as pd
 import yaml
 from packaging.version import Version
@@ -22,34 +69,33 @@ from packaging.version import Version
 import mlflow
 from mlflow import pyfunc
 from mlflow.exceptions import MlflowException
-from mlflow.models import Model, ModelInputExample
+from mlflow.models import Model, ModelInputExample, ModelSignature
 from mlflow.models.model import MLMODEL_FILE_NAME
-from mlflow.models.signature import ModelSignature
+from mlflow.models.signature import _infer_signature_from_input_example
 from mlflow.models.utils import _save_example
 from mlflow.protos.databricks_pb2 import INVALID_PARAMETER_VALUE
 from mlflow.tracking._model_registry import DEFAULT_AWAIT_MAX_SLEEP_SECONDS
 from mlflow.tracking.artifact_utils import _download_artifact_from_uri
-from mlflow.utils.model_utils import (
-    _get_flavor_configuration,
-    _validate_and_copy_code_paths,
-    _add_code_from_conf_to_system_path,
-    _validate_and_prepare_target_save_path,
+from mlflow.utils.docstring_utils import LOG_MODEL_PARAM_DOCS, format_docstring
+from mlflow.utils.environment import (
+    _CONDA_ENV_FILE_NAME,
+    _CONSTRAINTS_FILE_NAME,
+    _PYTHON_ENV_FILE_NAME,
+    _REQUIREMENTS_FILE_NAME,
+    _mlflow_conda_env,
+    _process_conda_env,
+    _process_pip_requirements,
+    _PythonEnv,
+    _validate_env_arguments,
 )
 from mlflow.utils.file_utils import write_to
-from mlflow.utils.requirements_utils import _get_pinned_requirement
-from mlflow.utils.environment import (
-    _mlflow_conda_env,
-    _validate_env_arguments,
-    _CONDA_ENV_FILE_NAME,
-    _process_pip_requirements,
-    _process_conda_env,
-    _CONSTRAINTS_FILE_NAME,
-    _REQUIREMENTS_FILE_NAME,
-    _PYTHON_ENV_FILE_NAME,
-    _PythonEnv,
+from mlflow.utils.model_utils import (
+    _add_code_from_conf_to_system_path,
+    _get_flavor_configuration,
+    _validate_and_copy_code_paths,
+    _validate_and_prepare_target_save_path,
 )
-from mlflow.utils.docstring_utils import format_docstring, LOG_MODEL_PARAM_DOCS
-
+from mlflow.utils.requirements_utils import _get_pinned_requirement
 
 FLAVOR_NAME = "pmdarima"
 _MODEL_BINARY_KEY = "data"
@@ -65,6 +111,7 @@ def get_default_pip_requirements():
              Calls to :func:`save_model()` and :func:`log_model()` produce a pip environment that,
              at a minimum, contains these requirements.
     """
+
     return [_get_pinned_requirement("pmdarima")]
 
 
@@ -73,6 +120,7 @@ def get_default_conda_env():
     :return: The default Conda environment for MLflow Models produced by calls to
              :func:`save_model()` and :func:`log_model()`
     """
+
     return _mlflow_conda_env(additional_pip_deps=get_default_pip_requirements())
 
 
@@ -100,16 +148,20 @@ def save_model(
                        containing file dependencies). These files are *prepended* to the system
                        path when the model is loaded.
     :param mlflow_model: :py:mod:`mlflow.models.Model` this flavor is being added to.
-    :param signature: :py:class:`Model Signature <mlflow.models.ModelSignature>` describes model
-                      input and output :py:class:`Schema <mlflow.types.Schema>`. The model
-                      signature can be :py:func:`inferred <mlflow.models.infer_signature>`
-                      from datasets with valid model input (e.g. the training dataset with target
-                      column omitted) and valid model output (e.g. model predictions generated on
-                      the training dataset), for example:
+    :param signature: an instance of the :py:class:`ModelSignature <mlflow.models.ModelSignature>`
+                      class that describes the model's inputs and outputs. If not specified but an
+                      ``input_example`` is supplied, a signature will be automatically inferred
+                      based on the supplied input example and model. To disable automatic signature
+                      inference when providing an input example, set ``signature`` to ``False``.
+                      To manually infer a model signature, call
+                      :py:func:`infer_signature() <mlflow.models.infer_signature>` on datasets
+                      with valid model inputs, such as a training dataset with the target column
+                      omitted, and valid model outputs, like model predictions made on the training
+                      dataset, for example:
 
                       .. code-block:: python
 
-                        from mlflow.models.signature import infer_signature
+                        from mlflow.models import infer_signature
 
                         model = pmdarima.auto_arima(data)
                         predictions = model.predict(n_periods=30, return_conf_int=False)
@@ -120,19 +172,42 @@ def save_model(
                         will not be inferred due to the complex tuple return type when using the
                         native ``ARIMA.predict()`` API. ``infer_schema`` will function correctly
                         if using the ``pyfunc`` flavor of the model, though.
-
-    :param input_example: Input example provides one or several instances of valid
-                          model input. The example can be used as a hint of what data to feed the
-                          model. The given example will be converted to a ``Pandas DataFrame`` and
-                          then serialized to json using the ``Pandas`` split-oriented format.
-                          Bytes are base64-encoded.
+    :param input_example: {{ input_example }}
     :param pip_requirements: {{ pip_requirements }}
     :param extra_pip_requirements: {{ extra_pip_requirements }}
     :param metadata: Custom metadata dictionary passed to the model and stored in the MLmodel file.
 
                      .. Note:: Experimental: This parameter may change or be removed in a future
                                              release without warning.
+
+    .. code-block:: python
+        :caption: Example
+
+        import pandas as pd
+        import mlflow
+        import pmdarima
+
+        # Specify locations of source data and the model artifact
+        SOURCE_DATA = "https://raw.githubusercontent.com/facebook/prophet/master/examples/example_retail_sales.csv"
+        ARTIFACT_PATH = "model"
+
+        # Read data and recode columns
+        sales_data = pd.read_csv(SOURCE_DATA)
+        sales_data.rename(columns={"y": "sales", "ds": "date"}, inplace=True)
+
+        # Split the data into train/test
+        train_size = int(0.8 * len(sales_data))
+        train, test = sales_data[:train_size], sales_data[train_size:]
+
+        with mlflow.start_run():
+            # Create the model
+            model = pmdarima.auto_arima(train["sales"], seasonal=True, m=12)
+
+            # Save the model to the specified path
+            mlflow.pmdarima.save_model(model, "model")
+
     """
+
     import pmdarima
 
     _validate_env_arguments(conda_env, pip_requirements, extra_pip_requirements)
@@ -140,6 +215,12 @@ def save_model(
     path = os.path.abspath(path)
     _validate_and_prepare_target_save_path(path)
     code_dir_subpath = _validate_and_copy_code_paths(code_paths, path)
+
+    if signature is None and input_example is not None:
+        wrapped_model = _PmdarimaModelWrapper(pmdarima_model)
+        signature = _infer_signature_from_input_example(input_example, wrapped_model)
+    elif signature is False:
+        signature = None
 
     if mlflow_model is None:
         mlflow_model = Model()
@@ -226,16 +307,20 @@ def log_model(
                                   future release without warning. If given, create a model
                                   version under ``registered_model_name``, also creating a
                                   registered model if one with the given name does not exist.
-    :param signature: :py:class:`Model Signature <mlflow.models.ModelSignature>` describes model
-                      input and output :py:class:`Schema <mlflow.types.Schema>`. The model
-                      signature can be :py:func:`inferred <mlflow.models.infer_signature>`
-                      from datasets with valid model input (e.g. the training dataset with target
-                      column omitted) and valid model output (e.g. model predictions generated on
-                      the training dataset), for example:
+    :param signature: an instance of the :py:class:`ModelSignature <mlflow.models.ModelSignature>`
+                      class that describes the model's inputs and outputs. If not specified but an
+                      ``input_example`` is supplied, a signature will be automatically inferred
+                      based on the supplied input example and model. To disable automatic signature
+                      inference when providing an input example, set ``signature`` to ``False``.
+                      To manually infer a model signature, call
+                      :py:func:`infer_signature() <mlflow.models.infer_signature>` on datasets
+                      with valid model inputs, such as a training dataset with the target column
+                      omitted, and valid model outputs, like model predictions made on the training
+                      dataset, for example:
 
                       .. code-block:: python
 
-                        from mlflow.models.signature import infer_signature
+                        from mlflow.models import infer_signature
 
                         model = pmdarima.auto_arima(data)
                         predictions = model.predict(n_periods=30, return_conf_int=False)
@@ -247,11 +332,7 @@ def log_model(
                         native ``ARIMA.predict()`` API. ``infer_schema`` will function correctly
                         if using the ``pyfunc`` flavor of the model, though.
 
-    :param input_example: Input example provides one or several instances of valid
-                          model input. The example can be used as a hint of what data to feed the
-                          model. The given example will be converted to a ``Pandas DataFrame`` and
-                          then serialized to json using the ``Pandas`` split-oriented format.
-                          Bytes are base64-encoded.
+    :param input_example: {{ input_example }}
     :param await_registration_for: Number of seconds to wait for the model version
                                    to finish being created and is in ``READY`` status.
                                    By default, the function waits for five minutes.
@@ -265,6 +346,44 @@ def log_model(
     :param kwargs: Additional arguments for :py:class:`mlflow.models.model.Model`
     :return: A :py:class:`ModelInfo <mlflow.models.model.ModelInfo>` instance that contains the
              metadata of the logged model.
+
+    .. code-block:: python
+        :caption: Example
+
+        import pandas as pd
+        import mlflow
+        from mlflow.models import infer_signature
+        import pmdarima
+        from pmdarima.metrics import smape
+
+        # Specify locations of source data and the model artifact
+        SOURCE_DATA = "https://raw.githubusercontent.com/facebook/prophet/master/examples/example_retail_sales.csv"
+        ARTIFACT_PATH = "model"
+
+        # Read data and recode columns
+        sales_data = pd.read_csv(SOURCE_DATA)
+        sales_data.rename(columns={"y": "sales", "ds": "date"}, inplace=True)
+
+        # Split the data into train/test
+        train_size = int(0.8 * len(sales_data))
+        train, test = sales_data[:train_size], sales_data[train_size:]
+
+        with mlflow.start_run():
+            # Create the model
+            model = pmdarima.auto_arima(train["sales"], seasonal=True, m=12)
+
+            # Calculate metrics
+            prediction = model.predict(n_periods=len(test))
+            metrics = {"smape": smape(test["sales"], prediction)}
+
+            # Infer signature
+            input_sample = pd.DataFrame(train["sales"])
+            output_sample = pd.DataFrame(model.predict(n_periods=5))
+            signature = infer_signature(input_sample, output_sample)
+
+            # Log model
+            mlflow.pmdarima.log_model(model, ARTIFACT_PATH, signature=signature)
+
     """
 
     return Model.log(
@@ -304,7 +423,69 @@ def load_model(model_uri, dst_path=None):
                      path will be created.
 
     :return: A ``pmdarima`` model instance
+
+    .. code-block:: python
+        :caption: Example
+
+        import pandas as pd
+        import mlflow
+        from mlflow.models import infer_signature
+        import pmdarima
+        from pmdarima.metrics import smape
+
+        # Specify locations of source data and the model artifact
+        SOURCE_DATA = "https://raw.githubusercontent.com/facebook/prophet/master/examples/example_retail_sales.csv"
+        ARTIFACT_PATH = "model"
+
+        # Read data and recode columns
+        sales_data = pd.read_csv(SOURCE_DATA)
+        sales_data.rename(columns={"y": "sales", "ds": "date"}, inplace=True)
+
+        # Split the data into train/test
+        train_size = int(0.8 * len(sales_data))
+        train, test = sales_data[:train_size], sales_data[train_size:]
+
+        with mlflow.start_run():
+            # Create the model
+            model = pmdarima.auto_arima(train["sales"], seasonal=True, m=12)
+
+            # Calculate metrics
+            prediction = model.predict(n_periods=len(test))
+            metrics = {"smape": smape(test["sales"], prediction)}
+
+            # Infer signature
+            input_sample = pd.DataFrame(train["sales"])
+            output_sample = pd.DataFrame(model.predict(n_periods=5))
+            signature = infer_signature(input_sample, output_sample)
+
+            # Log model
+            input_example = input_sample.head()
+            mlflow.pmdarima.log_model(
+                model, ARTIFACT_PATH, signature=signature, input_example=input_example
+            )
+
+            # Get the model URI for loading
+            model_uri = mlflow.get_artifact_uri(ARTIFACT_PATH)
+
+        # Load the model
+        loaded_model = mlflow.pmdarima.load_model(model_uri)
+
+        # Forecast for the next 60 days
+        forecast = loaded_model.predict(n_periods=60)
+
+        print(f"forecast: {forecast}")
+
+    .. code-block:: text
+        :caption: Output
+
+        forecast:
+        234    382452.397246
+        235    380639.458720
+        236    359805.611219
+        ...
+
     """
+
     local_model_path = _download_artifact_from_uri(artifact_uri=model_uri, output_path=dst_path)
     flavor_conf = _get_flavor_configuration(model_path=local_model_path, flavor_name=FLAVOR_NAME)
     _add_code_from_conf_to_system_path(local_model_path, flavor_conf)
@@ -337,7 +518,18 @@ class _PmdarimaModelWrapper:
         self.pmdarima_model = pmdarima_model
         self._pmdarima_version = pmdarima.__version__
 
-    def predict(self, dataframe) -> pd.DataFrame:
+    def predict(
+        self, dataframe, params: Optional[Dict[str, Any]] = None
+    ) -> pd.DataFrame:  # pylint: disable=unused-argument
+        """
+        :param dataframe: Model input data.
+        :param params: Additional parameters to pass to the model for inference.
+
+                       .. Note:: Experimental: This parameter may change or be removed in a future
+                                               release without warning.
+
+        :return: Model predictions.
+        """
         df_schema = dataframe.columns.values.tolist()
 
         if len(dataframe) > 1:

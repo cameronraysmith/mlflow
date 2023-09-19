@@ -6,10 +6,15 @@ on:
       - published
       - edited
 
+permissions:
+  contents: read
+
 jobs:
   push-images:
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    permissions:
+      packages: write # to push to ghcr.io
     steps:
       - uses: actions/checkout@v3
 
@@ -50,6 +55,7 @@ jobs:
           context: docker
           push: true
           tags: ${{ steps.meta.outputs.tags }}
+          platforms: linux/amd64,linux/arm64
           build-args: |
             VERSION=${{ steps.meta.outputs.version }}
 

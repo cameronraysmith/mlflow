@@ -1,12 +1,12 @@
 import os
 import pathlib
 import re
-from distutils.dir_util import copy_tree
+import shutil
+from unittest import mock
 
 import pandas as pd
 import pytest
 import yaml
-from unittest import mock
 
 import mlflow
 from mlflow.entities import Run, SourceType
@@ -15,28 +15,22 @@ from mlflow.exceptions import MlflowException
 from mlflow.recipes.recipe import Recipe
 from mlflow.recipes.step import BaseStep
 from mlflow.recipes.utils.execution import (
-    get_step_output_path,
-    _get_execution_directory_basename,
     _MAKEFILE_FORMAT_STRING,
+    _get_execution_directory_basename,
+    get_step_output_path,
 )
 from mlflow.tracking.client import MlflowClient
 from mlflow.tracking.context.registry import resolve_tags
 from mlflow.utils.file_utils import path_to_local_file_uri
 from mlflow.utils.mlflow_tags import (
-    MLFLOW_SOURCE_NAME,
+    LEGACY_MLFLOW_GIT_REPO_URL,
     MLFLOW_GIT_COMMIT,
     MLFLOW_GIT_REPO_URL,
-    LEGACY_MLFLOW_GIT_REPO_URL,
+    MLFLOW_SOURCE_NAME,
     MLFLOW_SOURCE_TYPE,
 )
 
-# pylint: disable=unused-import
-from tests.recipes.helper_functions import (
-    enter_recipe_example_directory,
-    enter_test_recipe_directory,
-    list_all_artifacts,
-    chdir,
-)  # pylint: enable=unused-import
+from tests.recipes.helper_functions import chdir, list_all_artifacts
 
 # _STEP_NAMES must contain all step names that are expected to be executed when
 # `recipe.run(step=None)` is called
@@ -62,7 +56,7 @@ def test_create_recipe_and_clean_works():
 @pytest.mark.parametrize("empty_profile", [None, ""])
 def test_create_recipe_fails_with_empty_profile_name(empty_profile):
     with pytest.raises(MlflowException, match="A profile name must be provided"):
-        _ = Recipe(profile=empty_profile)
+        Recipe(profile=empty_profile)
 
 
 @pytest.mark.usefixtures("enter_recipe_example_directory")
@@ -71,7 +65,7 @@ def test_create_recipe_fails_with_path_containing_space(tmp_path):
     space_path = space_parent / "child"
     os.makedirs(space_parent, exist_ok=True)
     os.makedirs(space_path, exist_ok=True)
-    copy_tree(os.getcwd(), str(space_path))
+    shutil.copytree(src=os.getcwd(), dst=str(space_path), dirs_exist_ok=True)
 
     with chdir(space_path), pytest.raises(
         MlflowException, match="Recipe directory path cannot contain spaces"
@@ -211,9 +205,11 @@ def test_recipes_run_throws_exception_and_produces_failure_card_when_step_fails(
 
     recipe = Recipe(profile="local")
     recipe.clean()
-    with pytest.raises(MlflowException, match="Failed to run.*test_recipe.*ingest"):
+    with pytest.raises(
+        MlflowException, match="Failed to run recipe.*test_recipe.*\n.*Step:ingest.*"
+    ):
         recipe.run()
-    with pytest.raises(MlflowException, match="Failed to run.*split.*test_recipe.*ingest"):
+    with pytest.raises(MlflowException, match="Failed to run step.*split.*\n.*Step:ingest.*"):
         recipe.run(step="split")
 
     step_card_path = get_step_output_path(

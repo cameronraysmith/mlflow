@@ -1,38 +1,39 @@
+import json
 import os
+from collections import namedtuple
+from datetime import date, datetime, timedelta
 from pathlib import Path
-import pytest
-import yaml
+from unittest import mock
+
 import numpy as np
 import pandas as pd
-from collections import namedtuple
-from datetime import datetime, timedelta, date
-from unittest import mock
-import json
-
+import prophet
+import pytest
+import yaml
+from packaging.version import Version
 from prophet import Prophet
 
 import mlflow
 import mlflow.prophet
-import mlflow.utils
 import mlflow.pyfunc.scoring_server as pyfunc_scoring_server
+import mlflow.utils
 from mlflow import pyfunc
-from mlflow.utils.environment import _mlflow_conda_env
+from mlflow.models import Model, infer_signature
 from mlflow.models.utils import _read_example
-from mlflow.models import infer_signature, Model
 from mlflow.store.artifact.s3_artifact_repo import S3ArtifactRepository
-from mlflow.utils.model_utils import _get_flavor_configuration
 from mlflow.tracking.artifact_utils import _download_artifact_from_uri
-from mlflow.tracking._model_registry import DEFAULT_AWAIT_MAX_SLEEP_SECONDS
+from mlflow.utils.environment import _mlflow_conda_env
+from mlflow.utils.model_utils import _get_flavor_configuration
 
 from tests.helper_functions import (
-    _compare_conda_env_requirements,
     _assert_pip_requirements,
-    pyfunc_serve_and_score_model,
+    _compare_conda_env_requirements,
     _compare_logged_code_paths,
     _is_available_on_pypi,
     _mlflow_major_version_string,
+    assert_register_model_called_with_local_model_path,
+    pyfunc_serve_and_score_model,
 )
-
 
 EXTRA_PYFUNC_SERVING_TEST_ARGS = (
     [] if _is_available_on_pypi("prophet") else ["--env-manager", "local"]
@@ -61,10 +62,9 @@ class DataGeneration:
         seasonal = [
             np.polyval([-5.0, -1.0], x) for x in np.linspace(start=0, stop=2, num=self.size)
         ]
-        series = (
+        return (
             np.linspace(start=45.0, stop=90.0, num=self.size) + base + seasonal + self._period_gen()
         )
-        return series
 
     def _generate_linear_data(self):
         DataStruct = namedtuple("DataStruct", "dates, series")
@@ -175,7 +175,8 @@ def test_signature_and_examples_saved_correctly(
     data = prophet_model.data
     model = prophet_model.model
     horizon_df = future_horizon_df(model, FORECAST_HORIZON)
-    signature = infer_signature(data, model.predict(horizon_df)) if use_signature else None
+    signature_ = infer_signature(data, model.predict(horizon_df))
+    signature = signature_ if use_signature else None
     if use_example:
         example = data[0:5].copy(deep=False)
         example["y"] = pd.to_numeric(example["y"])  # cast to appropriate precision
@@ -183,7 +184,10 @@ def test_signature_and_examples_saved_correctly(
         example = None
     mlflow.prophet.save_model(model, path=model_path, signature=signature, input_example=example)
     mlflow_model = Model.load(model_path)
-    assert signature == mlflow_model.signature
+    if signature is None and example is None:
+        assert mlflow_model.signature is None
+    else:
+        assert mlflow_model.signature == signature_
     if example is None:
         assert mlflow_model.saved_input_example_info is None
     else:
@@ -243,7 +247,7 @@ def test_prophet_log_model(prophet_model, tmp_path, should_start_run):
 
 def test_log_model_calls_register_model(prophet_model, tmp_path):
     artifact_path = "prophet"
-    register_model_patch = mock.patch("mlflow.register_model")
+    register_model_patch = mock.patch("mlflow.tracking._model_registry.fluent._register_model")
     with mlflow.start_run(), register_model_patch:
         conda_env = tmp_path.joinpath("conda_env.yaml")
         _mlflow_conda_env(conda_env, additional_pip_deps=["pystan", "prophet"])
@@ -254,21 +258,23 @@ def test_log_model_calls_register_model(prophet_model, tmp_path):
             registered_model_name="ProphetModel1",
         )
         model_uri = f"runs:/{mlflow.active_run().info.run_id}/{artifact_path}"
-        mlflow.register_model.assert_called_once_with(
-            model_uri, "ProphetModel1", await_registration_for=DEFAULT_AWAIT_MAX_SLEEP_SECONDS
+        assert_register_model_called_with_local_model_path(
+            register_model_mock=mlflow.tracking._model_registry.fluent._register_model,
+            model_uri=model_uri,
+            registered_model_name="ProphetModel1",
         )
 
 
 def test_log_model_no_registered_model_name(prophet_model, tmp_path):
     artifact_path = "prophet"
-    register_model_patch = mock.patch("mlflow.register_model")
+    register_model_patch = mock.patch("mlflow.tracking._model_registry.fluent._register_model")
     with mlflow.start_run(), register_model_patch:
         conda_env = tmp_path.joinpath("conda_env.yaml")
         _mlflow_conda_env(conda_env, additional_pip_deps=["pystan", "prophet"])
         mlflow.prophet.log_model(
             pr_model=prophet_model.model, artifact_path=artifact_path, conda_env=str(conda_env)
         )
-        mlflow.register_model.assert_not_called()
+        mlflow.tracking._model_registry.fluent._register_model.assert_not_called()
 
 
 def test_model_save_persists_specified_conda_env_in_mlflow_model_directory(
@@ -386,7 +392,12 @@ def test_model_log_without_specified_conda_env_uses_default_env_with_expected_de
 def test_pyfunc_serve_and_score(prophet_model):
     artifact_path = "model"
     with mlflow.start_run():
-        mlflow.prophet.log_model(prophet_model.model, artifact_path)
+        extra_pip_requirements = (
+            ["holidays<=0.24"] if Version(prophet.__version__) <= Version("1.1.3") else []
+        ) + (["pandas<2"] if Version(prophet.__version__) < Version("1.1") else [])
+        mlflow.prophet.log_model(
+            prophet_model.model, artifact_path, extra_pip_requirements=extra_pip_requirements
+        )
         model_uri = mlflow.get_artifact_uri(artifact_path)
     local_predict = prophet_model.model.predict(
         prophet_model.model.make_future_dataframe(FORECAST_HORIZON)
@@ -406,7 +417,6 @@ def test_pyfunc_serve_and_score(prophet_model):
         content_type=pyfunc_scoring_server.CONTENT_TYPE_JSON,
         extra_args=EXTRA_PYFUNC_SERVING_TEST_ARGS,
     )
-
     scores = pd.DataFrame(data=json.loads(resp.content.decode("utf-8"))["predictions"])
 
     # predictions are deterministic, but yhat_lower, yhat_upper are non-deterministic based on
@@ -459,3 +469,17 @@ def test_model_log_with_metadata(prophet_model):
 
     reloaded_model = mlflow.pyfunc.load_model(model_uri=model_uri)
     assert reloaded_model.metadata.metadata["metadata_key"] == "metadata_value"
+
+
+def test_model_log_with_signature_inference(prophet_model):
+    artifact_path = "model"
+    model = prophet_model.model
+    horizon_df = future_horizon_df(model, FORECAST_HORIZON)
+    signature = infer_signature(horizon_df, model.predict(horizon_df))
+
+    with mlflow.start_run():
+        mlflow.prophet.log_model(model, artifact_path=artifact_path, input_example=horizon_df)
+        model_uri = mlflow.get_artifact_uri(artifact_path)
+
+    model_info = Model.load(model_uri)
+    assert model_info.signature == signature

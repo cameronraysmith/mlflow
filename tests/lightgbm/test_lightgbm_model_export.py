@@ -1,37 +1,39 @@
+import json
 import os
-from pathlib import Path
-import pytest
-import yaml
 from collections import namedtuple
+from pathlib import Path
 from unittest import mock
 
-import json
+import lightgbm as lgb
 import numpy as np
 import pandas as pd
+import pytest
+import yaml
 from sklearn import datasets
 from sklearn.pipeline import Pipeline
-import lightgbm as lgb
 
 import mlflow.lightgbm
-import mlflow.utils
 import mlflow.pyfunc.scoring_server as pyfunc_scoring_server
+import mlflow.utils
 from mlflow import pyfunc
+from mlflow.models import Model, ModelSignature
 from mlflow.models.utils import _read_example
-from mlflow.models import Model, infer_signature
 from mlflow.store.artifact.s3_artifact_repo import S3ArtifactRepository
 from mlflow.tracking.artifact_utils import _download_artifact_from_uri
+from mlflow.types import DataType
+from mlflow.types.schema import ColSpec, Schema, TensorSpec
 from mlflow.utils.environment import _mlflow_conda_env
 from mlflow.utils.file_utils import TempDir
 from mlflow.utils.model_utils import _get_flavor_configuration
-from mlflow.tracking._model_registry import DEFAULT_AWAIT_MAX_SLEEP_SECONDS
 
 from tests.helper_functions import (
-    pyfunc_serve_and_score_model,
-    _compare_conda_env_requirements,
     _assert_pip_requirements,
-    _is_available_on_pypi,
+    _compare_conda_env_requirements,
     _compare_logged_code_paths,
+    _is_available_on_pypi,
     _mlflow_major_version_string,
+    assert_register_model_called_with_local_model_path,
+    pyfunc_serve_and_score_model,
 )
 
 EXTRA_PYFUNC_SERVING_TEST_ARGS = (
@@ -55,6 +57,19 @@ def lgb_model():
 
 
 @pytest.fixture(scope="module")
+def lgb_model_signature():
+    return ModelSignature(
+        inputs=Schema(
+            [
+                ColSpec(name="sepal length (cm)", type=DataType.double),
+                ColSpec(name="sepal width (cm)", type=DataType.double),
+            ]
+        ),
+        outputs=Schema([TensorSpec(np.dtype("float64"), (-1, 3))]),
+    )
+
+
+@pytest.fixture(scope="module")
 def lgb_sklearn_model():
     iris = datasets.load_iris()
     X = pd.DataFrame(
@@ -67,13 +82,13 @@ def lgb_sklearn_model():
 
 
 @pytest.fixture
-def model_path(tmpdir):
-    return os.path.join(str(tmpdir), "model")
+def model_path(tmp_path):
+    return os.path.join(tmp_path, "model")
 
 
 @pytest.fixture
-def lgb_custom_env(tmpdir):
-    conda_env = os.path.join(str(tmpdir), "conda_env.yml")
+def lgb_custom_env(tmp_path):
+    conda_env = os.path.join(tmp_path, "conda_env.yml")
     _mlflow_conda_env(conda_env, additional_pip_deps=["lightgbm", "pytest"])
     return conda_env
 
@@ -113,12 +128,11 @@ def test_sklearn_model_save_load(lgb_sklearn_model, model_path):
     )
 
 
-def test_signature_and_examples_are_saved_correctly(lgb_model):
+def test_signature_and_examples_are_saved_correctly(lgb_model, lgb_model_signature):
     model = lgb_model.model
     X = lgb_model.inference_dataframe
-    signature_ = infer_signature(X)
     example_ = X.head(3)
-    for signature in (None, signature_):
+    for signature in (None, lgb_model_signature):
         for example in (None, example_):
             with TempDir() as tmp:
                 path = tmp.path("model")
@@ -126,7 +140,10 @@ def test_signature_and_examples_are_saved_correctly(lgb_model):
                     model, path=path, signature=signature, input_example=example
                 )
                 mlflow_model = Model.load(path)
-                assert signature == mlflow_model.signature
+                if signature is None and example is None:
+                    assert mlflow_model.signature is None
+                else:
+                    assert mlflow_model.signature == lgb_model_signature
                 if example is None:
                     assert mlflow_model.saved_input_example_info is None
                 else:
@@ -164,9 +181,7 @@ def test_model_log(lgb_model, model_path):
                 model_info = mlflow.lightgbm.log_model(
                     lgb_model=model, artifact_path=artifact_path, conda_env=conda_env
                 )
-                model_uri = "runs:/{run_id}/{artifact_path}".format(
-                    run_id=mlflow.active_run().info.run_id, artifact_path=artifact_path
-                )
+                model_uri = f"runs:/{mlflow.active_run().info.run_id}/{artifact_path}"
                 assert model_info.model_uri == model_uri
                 reloaded_model = mlflow.lightgbm.load_model(model_uri=model_uri)
                 np.testing.assert_array_almost_equal(
@@ -187,7 +202,7 @@ def test_model_log(lgb_model, model_path):
 
 def test_log_model_calls_register_model(lgb_model):
     artifact_path = "model"
-    register_model_patch = mock.patch("mlflow.register_model")
+    register_model_patch = mock.patch("mlflow.tracking._model_registry.fluent._register_model")
     with mlflow.start_run(), register_model_patch, TempDir(chdr=True, remove_on_exit=True) as tmp:
         conda_env = os.path.join(tmp.path(), "conda_env.yaml")
         _mlflow_conda_env(conda_env, additional_pip_deps=["lightgbm"])
@@ -197,24 +212,24 @@ def test_log_model_calls_register_model(lgb_model):
             conda_env=conda_env,
             registered_model_name="AdsModel1",
         )
-        model_uri = "runs:/{run_id}/{artifact_path}".format(
-            run_id=mlflow.active_run().info.run_id, artifact_path=artifact_path
-        )
-        mlflow.register_model.assert_called_once_with(
-            model_uri, "AdsModel1", await_registration_for=DEFAULT_AWAIT_MAX_SLEEP_SECONDS
+        model_uri = f"runs:/{mlflow.active_run().info.run_id}/{artifact_path}"
+        assert_register_model_called_with_local_model_path(
+            register_model_mock=mlflow.tracking._model_registry.fluent._register_model,
+            model_uri=model_uri,
+            registered_model_name="AdsModel1",
         )
 
 
 def test_log_model_no_registered_model_name(lgb_model):
     artifact_path = "model"
-    register_model_patch = mock.patch("mlflow.register_model")
+    register_model_patch = mock.patch("mlflow.tracking._model_registry.fluent._register_model")
     with mlflow.start_run(), register_model_patch, TempDir(chdr=True, remove_on_exit=True) as tmp:
         conda_env = os.path.join(tmp.path(), "conda_env.yaml")
         _mlflow_conda_env(conda_env, additional_pip_deps=["lightgbm"])
         mlflow.lightgbm.log_model(
             lgb_model=lgb_model.model, artifact_path=artifact_path, conda_env=conda_env
         )
-        mlflow.register_model.assert_not_called()
+        mlflow.tracking._model_registry.fluent._register_model.assert_not_called()
 
 
 def test_model_save_persists_specified_conda_env_in_mlflow_model_directory(
@@ -243,13 +258,13 @@ def test_model_save_persists_requirements_in_mlflow_model_directory(
     _compare_conda_env_requirements(lgb_custom_env, saved_pip_req_path)
 
 
-def test_log_model_with_pip_requirements(lgb_model, tmpdir):
+def test_log_model_with_pip_requirements(lgb_model, tmp_path):
     expected_mlflow_version = _mlflow_major_version_string()
     # Path to a requirements file
-    req_file = tmpdir.join("requirements.txt")
-    req_file.write("a")
+    req_file = tmp_path.joinpath("requirements.txt")
+    req_file.write_text("a")
     with mlflow.start_run():
-        mlflow.lightgbm.log_model(lgb_model.model, "model", pip_requirements=req_file.strpath)
+        mlflow.lightgbm.log_model(lgb_model.model, "model", pip_requirements=str(req_file))
         _assert_pip_requirements(
             mlflow.get_artifact_uri("model"), [expected_mlflow_version, "a"], strict=True
         )
@@ -257,7 +272,7 @@ def test_log_model_with_pip_requirements(lgb_model, tmpdir):
     # List of requirements
     with mlflow.start_run():
         mlflow.lightgbm.log_model(
-            lgb_model.model, "model", pip_requirements=[f"-r {req_file.strpath}", "b"]
+            lgb_model.model, "model", pip_requirements=[f"-r {req_file}", "b"]
         )
         _assert_pip_requirements(
             mlflow.get_artifact_uri("model"), [expected_mlflow_version, "a", "b"], strict=True
@@ -266,7 +281,7 @@ def test_log_model_with_pip_requirements(lgb_model, tmpdir):
     # Constraints file
     with mlflow.start_run():
         mlflow.lightgbm.log_model(
-            lgb_model.model, "model", pip_requirements=[f"-c {req_file.strpath}", "b"]
+            lgb_model.model, "model", pip_requirements=[f"-c {req_file}", "b"]
         )
         _assert_pip_requirements(
             mlflow.get_artifact_uri("model"),
@@ -276,15 +291,15 @@ def test_log_model_with_pip_requirements(lgb_model, tmpdir):
         )
 
 
-def test_log_model_with_extra_pip_requirements(lgb_model, tmpdir):
+def test_log_model_with_extra_pip_requirements(lgb_model, tmp_path):
     expected_mlflow_version = _mlflow_major_version_string()
     default_reqs = mlflow.lightgbm.get_default_pip_requirements()
 
     # Path to a requirements file
-    req_file = tmpdir.join("requirements.txt")
-    req_file.write("a")
+    req_file = tmp_path.joinpath("requirements.txt")
+    req_file.write_text("a")
     with mlflow.start_run():
-        mlflow.lightgbm.log_model(lgb_model.model, "model", extra_pip_requirements=req_file.strpath)
+        mlflow.lightgbm.log_model(lgb_model.model, "model", extra_pip_requirements=str(req_file))
         _assert_pip_requirements(
             mlflow.get_artifact_uri("model"), [expected_mlflow_version, *default_reqs, "a"]
         )
@@ -292,7 +307,7 @@ def test_log_model_with_extra_pip_requirements(lgb_model, tmpdir):
     # List of requirements
     with mlflow.start_run():
         mlflow.lightgbm.log_model(
-            lgb_model.model, "model", extra_pip_requirements=[f"-r {req_file.strpath}", "b"]
+            lgb_model.model, "model", extra_pip_requirements=[f"-r {req_file}", "b"]
         )
         _assert_pip_requirements(
             mlflow.get_artifact_uri("model"), [expected_mlflow_version, *default_reqs, "a", "b"]
@@ -301,7 +316,7 @@ def test_log_model_with_extra_pip_requirements(lgb_model, tmpdir):
     # Constraints file
     with mlflow.start_run():
         mlflow.lightgbm.log_model(
-            lgb_model.model, "model", extra_pip_requirements=[f"-c {req_file.strpath}", "b"]
+            lgb_model.model, "model", extra_pip_requirements=[f"-c {req_file}", "b"]
         )
         _assert_pip_requirements(
             mlflow.get_artifact_uri("model"),
@@ -332,9 +347,7 @@ def test_model_log_persists_specified_conda_env_in_mlflow_model_directory(
         mlflow.lightgbm.log_model(
             lgb_model=lgb_model.model, artifact_path=artifact_path, conda_env=lgb_custom_env
         )
-        model_uri = "runs:/{run_id}/{artifact_path}".format(
-            run_id=mlflow.active_run().info.run_id, artifact_path=artifact_path
-        )
+        model_uri = f"runs:/{mlflow.active_run().info.run_id}/{artifact_path}"
 
     model_path = _download_artifact_from_uri(artifact_uri=model_uri)
     pyfunc_conf = _get_flavor_configuration(model_path=model_path, flavor_name=pyfunc.FLAVOR_NAME)
@@ -355,9 +368,7 @@ def test_model_log_persists_requirements_in_mlflow_model_directory(lgb_model, lg
         mlflow.lightgbm.log_model(
             lgb_model=lgb_model.model, artifact_path=artifact_path, conda_env=lgb_custom_env
         )
-        model_uri = "runs:/{run_id}/{artifact_path}".format(
-            run_id=mlflow.active_run().info.run_id, artifact_path=artifact_path
-        )
+        model_uri = f"runs:/{mlflow.active_run().info.run_id}/{artifact_path}"
 
     model_path = _download_artifact_from_uri(artifact_uri=model_uri)
     saved_pip_req_path = os.path.join(model_path, "requirements.txt")
@@ -515,3 +526,26 @@ def test_model_log_with_metadata(lgb_model):
 
     reloaded_model = mlflow.pyfunc.load_model(model_uri=model_uri)
     assert reloaded_model.metadata.metadata["metadata_key"] == "metadata_value"
+
+
+def test_model_log_with_signature_inference(lgb_model):
+    artifact_path = "model"
+    X = lgb_model.inference_dataframe
+    example = X.head(3)
+
+    with mlflow.start_run():
+        mlflow.lightgbm.log_model(
+            lgb_model.model, artifact_path=artifact_path, input_example=example
+        )
+        model_uri = mlflow.get_artifact_uri(artifact_path)
+
+    mlflow_model = Model.load(model_uri)
+    assert mlflow_model.signature == ModelSignature(
+        inputs=Schema(
+            [
+                ColSpec(name="sepal length (cm)", type=DataType.double),
+                ColSpec(name="sepal width (cm)", type=DataType.double),
+            ]
+        ),
+        outputs=Schema([TensorSpec(np.dtype("float64"), (-1, 3))]),
+    )

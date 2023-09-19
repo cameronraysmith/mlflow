@@ -1,11 +1,12 @@
 """
 Definitions of click options shared by several CLI commands.
 """
-import click
 import warnings
 
-from mlflow.utils import env_manager as _EnvManager
+import click
+
 from mlflow.environment_variables import MLFLOW_DISABLE_ENV_MANAGER_CONDA_WARNING
+from mlflow.utils import env_manager as _EnvManager
 
 MODEL_PATH = click.option(
     "--model-path",
@@ -165,14 +166,18 @@ WORKERS = click.option(
     "-w",
     envvar="MLFLOW_WORKERS",
     default=None,
-    help="Number of gunicorn worker processes to handle requests (default: 4).",
+    help="Number of gunicorn worker processes to handle requests (default: 1).",
 )
 
 ENABLE_MLSERVER = click.option(
     "--enable-mlserver",
     is_flag=True,
     default=False,
-    help="Enable serving with MLServer through the v2 inference protocol.",
+    help=(
+        "Enable serving with MLServer through the v2 inference protocol. "
+        "You can use environment variables to configure MLServer. "
+        "(See https://mlserver.readthedocs.io/en/latest/reference/settings.html)"
+    ),
 )
 
 ARTIFACTS_DESTINATION = click.option(

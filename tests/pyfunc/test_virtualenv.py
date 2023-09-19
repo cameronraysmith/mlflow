@@ -3,23 +3,24 @@ import sys
 from collections import namedtuple
 from io import BytesIO
 from pathlib import Path
-from stat import S_IRUSR, S_IRGRP, S_IROTH, S_IXUSR, S_IXGRP, S_IXOTH
+from stat import S_IRGRP, S_IROTH, S_IRUSR, S_IXGRP, S_IXOTH, S_IXUSR
 
-import pytest
 import numpy as np
 import pandas as pd
+import pytest
 import sklearn
-from sklearn.linear_model import LogisticRegression
 from sklearn.datasets import load_iris
+from sklearn.linear_model import LogisticRegression
 
 import mlflow
+from mlflow.environment_variables import MLFLOW_ENV_ROOT
 from mlflow.pyfunc.scoring_server import CONTENT_TYPE_JSON
 from mlflow.utils.environment import _PYTHON_ENV_FILE_NAME, _REQUIREMENTS_FILE_NAME
 from mlflow.utils.virtualenv import (
-    _MLFLOW_ENV_ROOT_ENV_VAR,
     _is_pyenv_available,
     _is_virtualenv_available,
 )
+
 from tests.helper_functions import pyfunc_serve_and_score_model
 
 pytestmark = pytest.mark.skipif(
@@ -54,7 +55,7 @@ def serve_and_score(model_uri, data, extra_args=None):
 def temp_mlflow_env_root(tmp_path, monkeypatch):
     env_root = tmp_path / "envs"
     env_root.mkdir(exist_ok=True)
-    monkeypatch.setenv(_MLFLOW_ENV_ROOT_ENV_VAR, str(env_root))
+    monkeypatch.setenv(MLFLOW_ENV_ROOT.name, str(env_root))
     return env_root
 
 
@@ -132,6 +133,27 @@ def test_differenet_requirements_create_different_environments(temp_mlflow_env_r
     # Two environments should exist now because the first and second models have different
     # requirements
     assert len(list(temp_mlflow_env_root.iterdir())) == 2
+
+
+@use_temp_mlflow_env_root
+def test_environment_directory_is_cleaned_up_when_unexpected_error_occurs(
+    temp_mlflow_env_root, sklearn_model
+):
+    sklearn_req = "scikit-learn==999.999.999"
+    with mlflow.start_run():
+        model_info1 = mlflow.sklearn.log_model(
+            sklearn_model.model,
+            artifact_path="model",
+            pip_requirements=[sklearn_req],
+        )
+
+    try:
+        serve_and_score(model_info1.model_uri, sklearn_model.X_pred)
+    except Exception:
+        pass
+    else:
+        assert False, "Should have raised an exception"
+    assert len(list(temp_mlflow_env_root.iterdir())) == 0
 
 
 @use_temp_mlflow_env_root

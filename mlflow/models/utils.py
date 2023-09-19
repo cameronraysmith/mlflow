@@ -1,15 +1,16 @@
 import decimal
 import json
+import logging
 import os
-from typing import Union, Any, Dict, List
+from typing import Any, Dict, List, Optional, Union
 
 import numpy as np
 import pandas as pd
 
-from mlflow.exceptions import MlflowException, INVALID_PARAMETER_VALUE
+from mlflow.exceptions import INVALID_PARAMETER_VALUE, MlflowException
 from mlflow.models import Model
 from mlflow.store.artifact.utils.models import get_model_name_and_version
-from mlflow.types import DataType, Schema, TensorSpec
+from mlflow.types import DataType, ParamSchema, ParamSpec, Schema, TensorSpec
 from mlflow.types.utils import TensorsNotSupportedException, clean_tensor_type
 from mlflow.utils.annotations import experimental
 from mlflow.utils.proto_json_utils import (
@@ -20,24 +21,22 @@ from mlflow.utils.proto_json_utils import (
 from mlflow.utils.uri import get_databricks_profile_uri_from_artifact_uri
 
 try:
-    from scipy.sparse import csr_matrix, csc_matrix
+    from scipy.sparse import csc_matrix, csr_matrix
 
     HAS_SCIPY = True
 except ImportError:
     HAS_SCIPY = False
 
-ModelInputExample = Union[pd.DataFrame, np.ndarray, dict, list, "csr_matrix", "csc_matrix"]
+ModelInputExample = Union[
+    pd.DataFrame, np.ndarray, dict, list, "csr_matrix", "csc_matrix", str, bytes
+]
 
 PyFuncInput = Union[
-    pd.DataFrame,
-    pd.Series,
-    np.ndarray,
-    "csc_matrix",
-    "csr_matrix",
-    List[Any],
-    Dict[str, Any],
+    pd.DataFrame, pd.Series, np.ndarray, "csc_matrix", "csr_matrix", List[Any], Dict[str, Any], str
 ]
-PyFuncOutput = Union[pd.DataFrame, pd.Series, np.ndarray, list]
+PyFuncOutput = Union[pd.DataFrame, pd.Series, np.ndarray, list, str]
+
+_logger = logging.getLogger(__name__)
 
 
 class _Example:
@@ -123,10 +122,17 @@ class _Example:
         def _handle_dataframe_nans(df: pd.DataFrame):
             return df.where(df.notnull(), None)
 
-        def _handle_dataframe_input(input_ex):
+        def _coerce_to_pandas_df(input_ex):
             if isinstance(input_ex, dict):
                 if all(_is_scalar(x) for x in input_ex.values()):
                     input_ex = pd.DataFrame([input_ex])
+                elif all(isinstance(x, (str, list)) for x in input_ex.values()):
+                    for value in input_ex.values():
+                        if isinstance(value, list) and not all(_is_scalar(x) for x in value):
+                            raise TypeError(
+                                "List values within dictionaries must be of scalar type."
+                            )
+                    input_ex = pd.DataFrame(input_ex)
                 else:
                     raise TypeError(
                         "Data in the dictionary must be scalar or of type numpy.ndarray"
@@ -134,13 +140,13 @@ class _Example:
             elif isinstance(input_ex, list):
                 for i, x in enumerate(input_ex):
                     if isinstance(x, np.ndarray) and len(x.shape) > 1:
-                        raise TensorsNotSupportedException(
-                            "Row '{}' has shape {}".format(i, x.shape)
-                        )
+                        raise TensorsNotSupportedException(f"Row '{i}' has shape {x.shape}")
                 if all(_is_scalar(x) for x in input_ex):
                     input_ex = pd.DataFrame([input_ex], columns=range(len(input_ex)))
                 else:
                     input_ex = pd.DataFrame(input_ex)
+            elif isinstance(input_ex, (str, bytes)):
+                input_ex = pd.DataFrame([input_ex])
             elif not isinstance(input_ex, pd.DataFrame):
                 try:
                     import pyspark.sql.dataframe
@@ -153,21 +159,21 @@ class _Example:
                         )
                 except ImportError:
                     pass
-                raise TypeError(
-                    "Unexpected type of input_example. Expected one of "
-                    "(pandas.DataFrame, numpy.ndarray, dict, list), "
-                    "got {}".format(type(input_example))
-                )
-            result = _handle_dataframe_nans(input_ex).to_dict(orient="split")
+                input_ex = None
+            return input_ex
+
+        def _handle_dataframe_input(df):
+            result = _handle_dataframe_nans(df).to_dict(orient="split")
             # Do not include row index
             del result["index"]
-            if all(input_ex.columns == range(len(input_ex.columns))):
+            if all(df.columns == range(len(df.columns))):
                 # No need to write default column index out
                 del result["columns"]
             return result
 
         example_filename = "input_example.json"
         if _is_ndarray(input_example):
+            self._inference_data = input_example
             self.data = _handle_ndarray_input(input_example)
             self.info = {
                 "artifact_path": example_filename,
@@ -175,6 +181,7 @@ class _Example:
                 "format": "tf-serving",
             }
         elif _is_sparse_matrix(input_example):
+            self._inference_data = input_example
             self.data = _handle_sparse_matrix(input_example)
             if isinstance(input_example, csc_matrix):
                 example_type = "sparse_matrix_csc"
@@ -185,7 +192,22 @@ class _Example:
                 "type": example_type,
             }
         else:
-            self.data = _handle_dataframe_input(input_example)
+            self._inference_data = _coerce_to_pandas_df(input_example)
+            if self._inference_data is None:
+                raise TypeError(
+                    "Expected one of the following types:\n"
+                    "- pandas.DataFrame\n"
+                    "- numpy.ndarray\n"
+                    "- dictionary of (name -> numpy.ndarray)\n"
+                    "- scipy.sparse.csr_matrix\n"
+                    "- scipy.sparse.csc_matrix\n"
+                    "- dict\n"
+                    "- list\n"
+                    "- str\n"
+                    "- bytes\n"
+                    f"but got '{type(input_example)}'",
+                )
+            self.data = _handle_dataframe_input(self._inference_data)
             self.info = {
                 "artifact_path": example_filename,
                 "type": "dataframe",
@@ -196,6 +218,13 @@ class _Example:
         """Save the example as json at ``parent_dir_path``/`self.info['artifact_path']`."""
         with open(os.path.join(parent_dir_path, self.info["artifact_path"]), "w") as f:
             json.dump(self.data, f, cls=NumpyEncoder)
+
+    @property
+    def inference_data(self):
+        """
+        Returns the input example in a form that PyFunc wrapped models can score.
+        """
+        return self._inference_data
 
 
 def _save_example(mlflow_model: Model, input_example: ModelInputExample, path: str):
@@ -384,7 +413,7 @@ def _enforce_mlflow_datatype(name, values: pd.Series, t: DataType):
             return values.astype(np.dtype("datetime64[ns]"), errors="raise")
         except ValueError as e:
             raise MlflowException(
-                "Failed to convert column {} from type {} to {}.".format(name, values.dtype, t)
+                "Failed to convert column {name} from type {values.dtype} to {t}."
             ) from e
     if t == DataType.double and values.dtype == decimal.Decimal:
         # NB: Pyspark Decimal column get converted to decimal.Decimal when converted to pandas
@@ -394,7 +423,7 @@ def _enforce_mlflow_datatype(name, values: pd.Series, t: DataType):
             return pd.to_numeric(values, errors="raise")
         except ValueError:
             raise MlflowException(
-                "Failed to convert column {} from type {} to {}.".format(name, values.dtype, t)
+                f"Failed to convert column {name} from type {values.dtype} to {t}."
             )
 
     numpy_type = t.to_numpy()
@@ -436,21 +465,42 @@ def _enforce_mlflow_datatype(name, values: pd.Series, t: DataType):
             )
 
         raise MlflowException(
-            "Incompatible input types for column {}. "
-            "Can not safely convert {} to {}.{}".format(name, values.dtype, numpy_type, hint)
+            f"Incompatible input types for column {name}. "
+            f"Can not safely convert {values.dtype} to {numpy_type}.{hint}"
         )
 
 
-def _enforce_col_schema(pf_input: PyFuncInput, input_schema: Schema):
+def _enforce_unnamed_col_schema(pf_input: PyFuncInput, input_schema: Schema):
     """Enforce the input columns conform to the model's column-based signature."""
-    if input_schema.has_input_names():
-        input_names = input_schema.input_names()
-    else:
-        input_names = pf_input.columns[: len(input_schema.inputs)]
+    input_names = pf_input.columns[: len(input_schema.inputs)]
     input_types = input_schema.input_types()
     new_pf_input = pd.DataFrame()
     for i, x in enumerate(input_names):
         new_pf_input[x] = _enforce_mlflow_datatype(x, pf_input[x], input_types[i])
+    return new_pf_input
+
+
+def _enforce_named_col_schema(pf_input: PyFuncInput, input_schema: Schema):
+    """Enforce the input columns conform to the model's column-based signature."""
+    required_input_names = input_schema.required_input_names()
+    input_types = input_schema.input_types_dict()
+
+    new_pf_input = pd.DataFrame()
+    for x in required_input_names:
+        new_pf_input[x] = _enforce_mlflow_datatype(x, pf_input[x], input_types[x])
+
+    # Upstream validation means that if we're here, pf_input can only be a
+    # pandas dataframe or a dict.
+    optional_input_names = input_schema.optional_input_names()
+    if isinstance(pf_input, pd.DataFrame):
+        supplied_optional_inputs = [col for col in pf_input.columns if col in optional_input_names]
+    elif isinstance(pf_input, dict):
+        supplied_optional_inputs = [col for col in pf_input.keys() if col in optional_input_names]
+    else:
+        supplied_optional_inputs = []
+    # Iterate over supplied optional inputs rather than all optional inputs.
+    for x in supplied_optional_inputs:
+        new_pf_input[x] = _enforce_mlflow_datatype(x, pf_input[x], input_types[x])
     return new_pf_input
 
 
@@ -463,14 +513,17 @@ def _reshape_and_cast_pandas_column_values(name, pd_series, tensor_spec):
         )
 
     if np.isscalar(pd_series[0]):
-        if tensor_spec.shape != (-1,):
-            raise MlflowException(
-                f"The input pandas dataframe column '{name}' contains scalar "
-                "values, which requires the shape to be (-1,), but got tensor spec "
-                f"shape of {tensor_spec.shape}.",
-                error_code=INVALID_PARAMETER_VALUE,
-            )
-        return _enforce_tensor_spec(np.array(pd_series, dtype=tensor_spec.type), tensor_spec)
+        for shape in [(-1,), (-1, 1)]:
+            if tensor_spec.shape == shape:
+                return _enforce_tensor_spec(
+                    np.array(pd_series, dtype=tensor_spec.type).reshape(shape), tensor_spec
+                )
+        raise MlflowException(
+            f"The input pandas dataframe column '{name}' contains scalar "
+            "values, which requires the shape to be (-1,) or (-1, 1), but got tensor spec "
+            f"shape of {tensor_spec.shape}.",
+            error_code=INVALID_PARAMETER_VALUE,
+        )
     elif isinstance(pd_series[0], list) and np.isscalar(pd_series[0][0]):
         # If the pandas column contains list type values,
         # in this case, the shape and type information is lost,
@@ -536,9 +589,7 @@ def _enforce_tensor_schema(pf_input: PyFuncInput, input_schema: Schema):
                     raise MlflowException(
                         "This model contains a tensor-based model signature with input names,"
                         " which suggests a dictionary input mapping input name to a numpy"
-                        " array, but a dict with value type {} was found.".format(
-                            type(pf_input[col_name])
-                        ),
+                        f" array, but a dict with value type {type(pf_input[col_name])} was found.",
                         error_code=INVALID_PARAMETER_VALUE,
                     )
                 new_pf_input[col_name] = _enforce_tensor_spec(pf_input[col_name], tensor_spec)
@@ -606,38 +657,93 @@ def _enforce_schema(pf_input: PyFuncInput, input_schema: Schema):
     For tensor-based signatures, we make sure the shape and type of the input matches the shape
     and type specified in model's input schema.
     """
+
+    def _is_scalar(x):
+        return np.isscalar(x) or x is None
+
     if isinstance(pf_input, pd.Series):
         pf_input = pd.DataFrame(pf_input)
     if not input_schema.is_tensor_spec():
-        if isinstance(pf_input, (list, np.ndarray, dict, pd.Series)):
+        if isinstance(pf_input, (list, np.ndarray, dict, pd.Series, str, bytes)):
             try:
-                pf_input = pd.DataFrame(pf_input)
+                if isinstance(pf_input, (str, bytes)):
+                    pf_input = pd.DataFrame([pf_input])
+                elif isinstance(pf_input, dict) and all(
+                    _is_scalar(value) for value in pf_input.values()
+                ):
+                    pf_input = pd.DataFrame([pf_input])
+                elif isinstance(pf_input, dict) and all(
+                    isinstance(value, np.ndarray)
+                    and value.dtype.type == np.str_
+                    and value.size == 1
+                    and value.shape == ()
+                    for value in pf_input.values()
+                ):
+                    # This check is specifically to handle the serving structural cast for
+                    # certain inputs for the transformers implementation. Due to the fact that
+                    # specific Pipeline types in transformers support passing input data
+                    # of the form Dict[str, str] in which the value is a scalar string, model
+                    # serving will cast this entry as a numpy array with shape () and size 1.
+                    # This is seen as a scalar input when attempting to create a Pandas DataFrame
+                    # from such a numpy structure and requires the array to be encapsulated in a
+                    # list in order to prevent a ValueError exception for requiring an index
+                    # if passing in all scalar values thrown by Pandas.
+                    pf_input = pd.DataFrame([pf_input])
+                elif isinstance(pf_input, dict) and all(
+                    _is_scalar(value)
+                    or (isinstance(value, list) and all(isinstance(elem, str) for elem in value))
+                    for value in pf_input.values()
+                ):
+                    pf_input = pd.DataFrame([pf_input])
+                elif isinstance(pf_input, dict) and any(
+                    isinstance(value, np.ndarray) and value.ndim > 1 for value in pf_input.values()
+                ):
+                    # Pandas DataFrames can't be constructed with embedded multi-dimensional
+                    # numpy arrays. Accordingly, we convert any multi-dimensional numpy
+                    # arrays to lists before constructing a DataFrame. This is safe because ColSpec
+                    # model signatures do not support array columns, so subsequent validation logic
+                    # will result in a clear "incompatible input types" exception. This is
+                    # preferable to a pandas DataFrame construction error
+                    pf_input = pd.DataFrame(
+                        {
+                            key: (
+                                value.tolist()
+                                if (isinstance(value, np.ndarray) and value.ndim > 1)
+                                else value
+                            )
+                            for key, value in pf_input.items()
+                        }
+                    )
+                else:
+                    pf_input = pd.DataFrame(pf_input)
             except Exception as e:
                 raise MlflowException(
                     "This model contains a column-based signature, which suggests a DataFrame"
                     " input. There was an error casting the input data to a DataFrame:"
-                    " {}".format(str(e))
+                    f" {e}"
                 )
         if not isinstance(pf_input, pd.DataFrame):
             raise MlflowException(
-                "Expected input to be DataFrame or list. Found: %s" % type(pf_input).__name__
+                f"Expected input to be DataFrame or list. Found: {type(pf_input).__name__}"
             )
 
     if input_schema.has_input_names():
         # make sure there are no missing columns
-        input_names = input_schema.input_names()
-        expected_cols = set(input_names)
+        input_names = input_schema.required_input_names()
+        optional_names = input_schema.optional_input_names()
+        expected_required_cols = set(input_names)
         actual_cols = set()
-        if len(expected_cols) == 1 and isinstance(pf_input, np.ndarray):
+        optional_cols = set(optional_names)
+        if len(expected_required_cols) == 1 and isinstance(pf_input, np.ndarray):
             # for schemas with a single column, match input with column
             pf_input = {input_names[0]: pf_input}
-            actual_cols = expected_cols
+            actual_cols = expected_required_cols
         elif isinstance(pf_input, pd.DataFrame):
             actual_cols = set(pf_input.columns)
         elif isinstance(pf_input, dict):
             actual_cols = set(pf_input.keys())
-        missing_cols = expected_cols - actual_cols
-        extra_cols = actual_cols - expected_cols
+        missing_cols = expected_required_cols - actual_cols
+        extra_cols = actual_cols - expected_required_cols - optional_cols
         # Preserve order from the original columns, since missing/extra columns are likely to
         # be in same order.
         missing_cols = [c for c in input_names if c in missing_cols]
@@ -657,12 +763,12 @@ def _enforce_schema(pf_input: PyFuncInput, input_schema: Schema):
                 "{} inputs. Note: the inputs were not named in the signature so we can "
                 "only verify their count.".format(len(input_schema.inputs), num_actual_columns)
             )
-
-    return (
-        _enforce_tensor_schema(pf_input, input_schema)
-        if input_schema.is_tensor_spec()
-        else _enforce_col_schema(pf_input, input_schema)
-    )
+    if input_schema.is_tensor_spec():
+        return _enforce_tensor_schema(pf_input, input_schema)
+    elif input_schema.has_input_names():
+        return _enforce_named_col_schema(pf_input, input_schema)
+    else:
+        return _enforce_unnamed_col_schema(pf_input, input_schema)
 
 
 def validate_schema(data: PyFuncInput, expected_schema: Schema) -> None:
@@ -678,6 +784,7 @@ def validate_schema(data: PyFuncInput, expected_schema: Schema) -> None:
                  - scipy.sparse.csr_matrix
                  - List[Any]
                  - Dict[str, Any]
+                 - str
     :param expected_schema: Expected :py:class:`Schema <mlflow.types.Schema>` of the input data.
     :raises: A :py:class:`mlflow.exceptions.MlflowException`. when the input data does
              not match the schema.
@@ -737,14 +844,17 @@ def add_libraries_to_model(model_uri, run_id=None, registered_model_name=None):
         from sklearn.ensemble import RandomForestClassifier
         import mlflow
         import mlflow.sklearn
-        from mlflow.models.signature import infer_signature
+        from mlflow.models import infer_signature
 
         with mlflow.start_run():
             iris = datasets.load_iris()
             iris_train = pd.DataFrame(iris.data, columns=iris.feature_names)
             clf = RandomForestClassifier(max_depth=7, random_state=0)
             clf.fit(iris_train, iris.target)
-            mlflow.sklearn.log_model(clf, "iris_rf", registered_model_name="model-with-libs")
+            signature = infer_signature(iris_train, clf.predict(iris_train))
+            mlflow.sklearn.log_model(
+                clf, "iris_rf", signature=signature, registered_model_name="model-with-libs"
+            )
 
         # model uri for the above model
         model_uri = "models:/model-with-libs/1"
@@ -792,5 +902,66 @@ def get_model_version_from_model_uri(model_uri):
     )
     client = MlflowClient(registry_uri=databricks_profile_uri)
     (name, version) = get_model_name_and_version(client, model_uri)
-    model_version = client.get_model_version(name, version)
-    return model_version
+    return client.get_model_version(name, version)
+
+
+def _enforce_params_schema(params: Optional[Dict[str, Any]], schema: Optional[ParamSchema]):
+    if schema is None:
+        if params in [None, {}]:
+            return params
+        params_info = (
+            f"Ignoring provided params: {list(params.keys())}"
+            if isinstance(params, dict)
+            else "Ignoring invalid params (not a dictionary)."
+        )
+        _logger.warning(
+            "`params` can only be specified at inference time if the model signature "
+            f"defines a params schema. This model does not define a params schema. {params_info}",
+        )
+        return {}
+    params = {} if params is None else params
+    if not isinstance(params, dict):
+        raise MlflowException.invalid_parameter_value(
+            f"Parameters must be a dictionary. Got type '{type(params).__name__}'.",
+        )
+    if not isinstance(schema, ParamSchema):
+        raise MlflowException.invalid_parameter_value(
+            "Parameters schema must be an instance of ParamSchema. "
+            f"Got type '{type(schema).__name__}'.",
+        )
+    if any(not isinstance(k, str) for k in params.keys()):
+        _logger.warning(
+            "Keys in parameters should be of type `str`, but received non-string keys."
+            "Converting all keys to string..."
+        )
+        params = {str(k): v for k, v in params.items()}
+
+    allowed_keys = {param.name for param in schema.params}
+    ignored_keys = set(params) - allowed_keys
+    if ignored_keys:
+        _logger.warning(
+            f"Unrecognized params {list(ignored_keys)} are ignored for inference. "
+            f"Supported params are: {allowed_keys}. "
+            "To enable them, please add corresponding schema in ModelSignature."
+        )
+
+    params = {k: params[k] for k in params if k in allowed_keys}
+
+    invalid_params = set()
+    for param_spec in schema.params:
+        if param_spec.name in params:
+            try:
+                params[param_spec.name] = ParamSpec.validate_param_spec(
+                    params[param_spec.name], param_spec
+                )
+            except MlflowException as e:
+                invalid_params.add((param_spec.name, e.message))
+        else:
+            params[param_spec.name] = param_spec.default
+
+    if invalid_params:
+        raise MlflowException.invalid_parameter_value(
+            f"Invalid parameters found: {invalid_params!r}",
+        )
+
+    return params

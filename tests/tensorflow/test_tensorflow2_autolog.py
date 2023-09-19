@@ -1,26 +1,27 @@
 # pep8: disable=E501
 
 import collections
+import functools
+import json
 import os
 import pickle
 import sys
-from unittest.mock import patch
-import json
-import functools
 from pathlib import Path
+from unittest.mock import patch
 
 import numpy as np
 import pytest
 import tensorflow as tf
+import yaml
 from packaging.version import Version
 from tensorflow.keras import layers
-import yaml
 
 import mlflow
 from mlflow import MlflowClient
 from mlflow.models import Model
 from mlflow.models.utils import _read_example
-from mlflow.tensorflow._autolog import _TensorBoard, __MLflowTfKeras2Callback
+from mlflow.tensorflow._autolog import __MLflowTfKeras2Callback, _TensorBoard
+from mlflow.types.utils import _infer_schema
 from mlflow.utils.autologging_utils import (
     AUTOLOGGING_INTEGRATIONS,
     BatchMetricsLogger,
@@ -61,13 +62,12 @@ def random_train_dict_mapping(random_train_data):
     def _generate_features(pos):
         return [v[pos] for v in random_train_data]
 
-    features = {
+    return {
         "a": np.array(_generate_features(0)),
         "b": np.array(_generate_features(1)),
         "c": np.array(_generate_features(2)),
         "d": np.array(_generate_features(3)),
     }
-    return features
 
 
 def _create_model_for_dict_mapping():
@@ -98,8 +98,17 @@ def fashion_mnist_tf_dataset():
     images = images / 255.0
     labels = labels.astype(np.int32)
     fmnist_train_ds = tf.data.Dataset.from_tensor_slices((images, labels))
-    fmnist_train_ds = fmnist_train_ds.shuffle(5000).batch(32)
-    return fmnist_train_ds
+    return fmnist_train_ds.shuffle(5000).batch(32)
+
+
+@pytest.fixture
+def fashion_mnist_tf_dataset_eval():
+    _, eval_dataset = tf.keras.datasets.fashion_mnist.load_data()
+    images, labels = eval_dataset
+    images = images / 255.0
+    labels = labels.astype(np.int32)
+    fmnist_train_ds = tf.data.Dataset.from_tensor_slices((images, labels))
+    return fmnist_train_ds.shuffle(5000).batch(32)
 
 
 def _create_fashion_mnist_model():
@@ -169,6 +178,20 @@ def test_tf_keras_autolog_ends_auto_created_run(random_train_data, random_one_ho
     assert mlflow.active_run() is None
 
 
+def test_extra_tags_tensorflow_autolog(random_train_data, random_one_hot_labels):
+    mlflow.tensorflow.autolog(extra_tags={"test_tag": "tf_autolog"})
+
+    data = random_train_data
+    labels = random_one_hot_labels
+
+    model = create_tf_keras_model()
+    model.fit(data, labels, epochs=10)
+
+    run = mlflow.last_active_run()
+    assert run.data.tags["test_tag"] == "tf_autolog"
+    assert run.data.tags[mlflow.utils.mlflow_tags.MLFLOW_AUTOLOGGING] == "tensorflow"
+
+
 @pytest.mark.parametrize("log_models", [True, False])
 def test_tf_keras_autolog_log_models_configuration(
     random_train_data, random_one_hot_labels, log_models
@@ -188,6 +211,145 @@ def test_tf_keras_autolog_log_models_configuration(
     artifacts = client.list_artifacts(run_id)
     artifacts = (x.path for x in artifacts)
     assert ("model" in artifacts) == log_models
+
+
+@pytest.mark.parametrize("log_datasets", [True, False])
+def test_tf_keras_autolog_log_datasets_configuration_with_numpy(
+    random_train_data, random_one_hot_labels, log_datasets
+):
+    mlflow.tensorflow.autolog(log_datasets=log_datasets)
+
+    data = random_train_data
+    labels = random_one_hot_labels
+
+    model = create_tf_keras_model()
+
+    model.fit(data, labels, epochs=10)
+
+    client = MlflowClient()
+    dataset_inputs = client.get_run(mlflow.last_active_run().info.run_id).inputs.dataset_inputs
+    if log_datasets:
+        assert len(dataset_inputs) == 1
+        feature_schema = _infer_schema(data)
+        target_schema = _infer_schema(labels)
+        assert dataset_inputs[0].dataset.schema == json.dumps(
+            {
+                "mlflow_tensorspec": {
+                    "features": feature_schema.to_json(),
+                    "targets": target_schema.to_json(),
+                }
+            }
+        )
+    else:
+        assert len(dataset_inputs) == 0
+
+
+@pytest.mark.parametrize("log_datasets", [True, False])
+def test_tf_keras_autolog_log_datasets_configuration_with_tensor(
+    random_train_data, random_one_hot_labels, log_datasets
+):
+    mlflow.tensorflow.autolog(log_datasets=log_datasets)
+
+    data_as_tensor = tf.convert_to_tensor(random_train_data)
+    labels_as_tensor = tf.convert_to_tensor(random_one_hot_labels)
+
+    model = create_tf_keras_model()
+
+    model.fit(data_as_tensor, labels_as_tensor, epochs=10)
+
+    client = MlflowClient()
+    dataset_inputs = client.get_run(mlflow.last_active_run().info.run_id).inputs.dataset_inputs
+    if log_datasets:
+        assert len(dataset_inputs) == 1
+        feature_schema = _infer_schema(data_as_tensor.numpy())
+        target_schema = _infer_schema(labels_as_tensor.numpy())
+        assert dataset_inputs[0].dataset.schema == json.dumps(
+            {
+                "mlflow_tensorspec": {
+                    "features": feature_schema.to_json(),
+                    "targets": target_schema.to_json(),
+                }
+            }
+        )
+    else:
+        assert len(dataset_inputs) == 0
+
+
+@pytest.mark.parametrize("log_datasets", [True, False])
+def test_tf_keras_autolog_log_datasets_configuration_with_tf_dataset(
+    fashion_mnist_tf_dataset, log_datasets
+):
+    mlflow.tensorflow.autolog(log_datasets=log_datasets)
+    fashion_mnist_model = _create_fashion_mnist_model()
+    fashion_mnist_model.fit(fashion_mnist_tf_dataset)
+
+    client = MlflowClient()
+    dataset_inputs = client.get_run(mlflow.last_active_run().info.run_id).inputs.dataset_inputs
+    if log_datasets:
+        assert len(dataset_inputs) == 1
+        numpy_data = next(fashion_mnist_tf_dataset.as_numpy_iterator())
+        assert dataset_inputs[0].dataset.schema == json.dumps(
+            {
+                "mlflow_tensorspec": {
+                    "features": _infer_schema(
+                        {str(i): data_element for i, data_element in enumerate(numpy_data)}
+                    ).to_json(),
+                    "targets": None,
+                }
+            }
+        )
+
+    else:
+        assert len(dataset_inputs) == 0
+
+
+def test_tf_keras_autolog_log_datasets_with_validation_data(
+    fashion_mnist_tf_dataset, fashion_mnist_tf_dataset_eval
+):
+    mlflow.tensorflow.autolog(log_datasets=True)
+    fashion_mnist_model = _create_fashion_mnist_model()
+    fashion_mnist_model.fit(fashion_mnist_tf_dataset, validation_data=fashion_mnist_tf_dataset_eval)
+
+    client = MlflowClient()
+    dataset_inputs = client.get_run(mlflow.last_active_run().info.run_id).inputs.dataset_inputs
+    assert len(dataset_inputs) == 2
+    assert dataset_inputs[0].tags[0].value == "train"
+    assert dataset_inputs[1].tags[0].value == "eval"
+
+
+def test_tf_keras_autolog_log_datasets_with_validation_data_as_numpy_tuple(
+    fashion_mnist_tf_dataset, fashion_mnist_tf_dataset_eval
+):
+    mlflow.tensorflow.autolog(log_datasets=True)
+    fashion_mnist_model = _create_fashion_mnist_model()
+    X_eval, y_eval = next(fashion_mnist_tf_dataset_eval.as_numpy_iterator())
+    fashion_mnist_model.fit(fashion_mnist_tf_dataset, validation_data=(X_eval, y_eval))
+
+    client = MlflowClient()
+    dataset_inputs = client.get_run(mlflow.last_active_run().info.run_id).inputs.dataset_inputs
+    assert len(dataset_inputs) == 2
+    assert dataset_inputs[0].tags[0].value == "train"
+    assert dataset_inputs[1].tags[0].value == "eval"
+
+
+def test_tf_keras_autolog_log_datasets_with_validation_data_as_tf_tuple(
+    fashion_mnist_tf_dataset, fashion_mnist_tf_dataset_eval
+):
+    mlflow.tensorflow.autolog(log_datasets=True)
+    fashion_mnist_model = _create_fashion_mnist_model()
+    # convert tensorflow dataset into tensors
+    X_eval, y_eval = next(fashion_mnist_tf_dataset_eval.as_numpy_iterator())
+    X_eval_tensor = tf.convert_to_tensor(X_eval)
+    y_eval_tensor = tf.convert_to_tensor(y_eval)
+    fashion_mnist_model.fit(
+        fashion_mnist_tf_dataset, validation_data=(X_eval_tensor, y_eval_tensor)
+    )
+
+    client = MlflowClient()
+    dataset_inputs = client.get_run(mlflow.last_active_run().info.run_id).inputs.dataset_inputs
+    assert len(dataset_inputs) == 2
+    assert dataset_inputs[0].tags[0].value == "train"
+    assert dataset_inputs[1].tags[0].value == "eval"
 
 
 def test_tf_keras_autolog_persists_manually_created_run(random_train_data, random_one_hot_labels):
@@ -265,14 +427,20 @@ def __example_tf_dataset(batch_size):
 
 
 class __ExampleSequence(tf.keras.utils.Sequence):
-    def __init__(self, batch_size):
+    def __init__(self, batch_size, with_sample_weights=False):
         self.batch_size = batch_size
+        self.with_sample_weights = with_sample_weights
 
     def __len__(self):
         return 10
 
     def __getitem__(self, idx):
-        return np.array([idx] * self.batch_size), np.array([-idx] * self.batch_size)
+        x = np.array([idx] * self.batch_size)
+        y = np.array([-idx] * self.batch_size)
+        if self.with_sample_weights:
+            w = np.array([1] * self.batch_size)
+            return x, y, w
+        return x, y
 
 
 def __generator(data, target, batch_size):
@@ -304,6 +472,7 @@ class __GeneratorClass:
     [
         __example_tf_dataset,
         __ExampleSequence,
+        functools.partial(__ExampleSequence, with_sample_weights=True),
         functools.partial(__generator, np.array([[1]] * 10), np.array([[1]] * 10)),
         functools.partial(__GeneratorClass, np.array([[1]] * 10), np.array([[1]] * 10)),
     ],
@@ -313,6 +482,85 @@ def test_tf_keras_autolog_implicit_batch_size_works(generate_data, batch_size):
     mlflow.autolog()
     model = tf.keras.Sequential()
     model.add(tf.keras.layers.Dense(1, input_shape=(1,)))
+    model.compile(loss="mse")
+
+    # 'x' passed as arg
+    model.fit(generate_data(batch_size), verbose=0)
+    assert mlflow.last_active_run().data.params["batch_size"] == str(batch_size)
+
+    # 'x' passed as kwarg
+    model.fit(x=generate_data(batch_size), verbose=0)
+    assert mlflow.last_active_run().data.params["batch_size"] == str(batch_size)
+
+
+def __tf_dataset_multi_input(batch_size):
+    a = tf.data.Dataset.range(1)
+    b = tf.data.Dataset.range(1)
+    c = tf.data.Dataset.range(1)
+    ds = tf.data.Dataset.zip(((a, b), c))
+    return ds.batch(batch_size)
+
+
+class __SequenceMultiInput(tf.keras.utils.Sequence):
+    def __init__(self, batch_size):
+        self.batch_size = batch_size
+
+    def __len__(self):
+        return 10
+
+    def __getitem__(self, idx):
+        return (np.random.rand(self.batch_size), np.random.rand(self.batch_size)), np.random.rand(
+            self.batch_size
+        )
+
+
+def __generator_multi_input(data, target, batch_size):
+    data_batches = np.split(data, data.shape[1] // batch_size, axis=1)
+    target_batches = np.split(target, target.shape[0] // batch_size)
+    for inputs, output in zip(data_batches, target_batches):
+        yield tuple(inputs), output
+
+
+class __GeneratorClassMultiInput:
+    def __init__(self, data, target, batch_size):
+        self.data = data
+        self.target = target
+        self.batch_size = batch_size
+        self.ptr = 0
+
+    def __next__(self):
+        if self.ptr >= len(self.data):
+            raise StopIteration
+        idx = self.ptr % len(self.data)
+        self.ptr += 1
+        return (
+            self.data[idx : idx + self.batch_size, 0],
+            self.data[idx : idx + self.batch_size, 1],
+        ), self.target[idx : idx + self.batch_size]
+
+    def __iter__(self):
+        return self
+
+
+@pytest.mark.parametrize(
+    "generate_data",
+    [
+        __tf_dataset_multi_input,
+        __SequenceMultiInput,
+        functools.partial(__generator_multi_input, np.random.rand(2, 10), np.random.rand(10)),
+        functools.partial(__GeneratorClassMultiInput, np.random.rand(10, 2), np.random.rand(10, 1)),
+    ],
+)
+@pytest.mark.parametrize("batch_size", [5, 10])
+def test_tf_keras_autolog_implicit_batch_size_works_multi_input(generate_data, batch_size):
+    mlflow.tensorflow.autolog()
+
+    input1 = tf.keras.Input(shape=(1,))
+    input2 = tf.keras.Input(shape=(1,))
+    concat = tf.keras.layers.Concatenate()([input1, input2])
+    output = tf.keras.layers.Dense(1, activation="sigmoid")(concat)
+
+    model = tf.keras.models.Model(inputs=[input1, input2], outputs=output)
     model.compile(loss="mse")
 
     # 'x' passed as arg
@@ -334,8 +582,8 @@ def test_tf_keras_autolog_implicit_batch_size_for_generator_dataset_without_side
     generator,
     batch_size,
 ):
-    from tensorflow.keras.models import Sequential
     from tensorflow.keras.layers import Dense
+    from tensorflow.keras.models import Sequential
 
     data = np.array([[1, 2, 3], [3, 2, 1], [2, 2, 2], [10, 20, 30], [30, 20, 10], [20, 20, 20]])
     target = np.array([[1], [3], [2], [11], [13], [12]])
@@ -688,7 +936,7 @@ def test_tf_keras_autolog_non_early_stop_callback_no_log(tf_keras_random_data_ru
 
 @pytest.mark.parametrize("positional", [True, False])
 def test_tf_keras_autolog_does_not_mutate_original_callbacks_list(
-    tmpdir, random_train_data, random_one_hot_labels, positional
+    tmp_path, random_train_data, random_one_hot_labels, positional
 ):
     """
     TensorFlow autologging passes new callbacks to the `fit()` / `fit_generator()` function. If
@@ -698,7 +946,7 @@ def test_tf_keras_autolog_does_not_mutate_original_callbacks_list(
     """
     mlflow.tensorflow.autolog()
 
-    tensorboard_callback = tf.keras.callbacks.TensorBoard(log_dir=tmpdir)
+    tensorboard_callback = tf.keras.callbacks.TensorBoard(log_dir=tmp_path)
     callbacks = [tensorboard_callback]
 
     model = create_tf_keras_model()
@@ -715,9 +963,9 @@ def test_tf_keras_autolog_does_not_mutate_original_callbacks_list(
 
 
 def test_tf_keras_autolog_does_not_delete_logging_directory_for_tensorboard_callback(
-    tmpdir, random_train_data, random_one_hot_labels
+    tmp_path, random_train_data, random_one_hot_labels
 ):
-    tensorboard_callback_logging_dir_path = str(tmpdir.mkdir("tb_logs"))
+    tensorboard_callback_logging_dir_path = str(tmp_path.joinpath("tb_logs"))
     tensorboard_callback = tf.keras.callbacks.TensorBoard(
         tensorboard_callback_logging_dir_path, histogram_freq=0
     )
@@ -734,15 +982,16 @@ def test_tf_keras_autolog_does_not_delete_logging_directory_for_tensorboard_call
 
 
 def test_tf_keras_autolog_logs_to_and_deletes_temporary_directory_when_tensorboard_callback_absent(
-    tmpdir, random_train_data, random_one_hot_labels
+    tmp_path, random_train_data, random_one_hot_labels
 ):
-    from unittest import mock
     from mlflow.tensorflow import _TensorBoardLogDir
 
     mlflow.tensorflow.autolog()
 
-    mock_log_dir_inst = _TensorBoardLogDir(location=str(tmpdir.mkdir("tb_logging")), is_temp=True)
-    with mock.patch("mlflow.tensorflow._TensorBoardLogDir", autospec=True) as mock_log_dir_class:
+    mock_log_dir_inst = _TensorBoardLogDir(
+        location=str(tmp_path.joinpath("tb_logging")), is_temp=True
+    )
+    with patch("mlflow.tensorflow._TensorBoardLogDir", autospec=True) as mock_log_dir_class:
         mock_log_dir_class.return_value = mock_log_dir_inst
 
         data = random_train_data
@@ -752,40 +1001,6 @@ def test_tf_keras_autolog_logs_to_and_deletes_temporary_directory_when_tensorboa
         model.fit(data, labels, epochs=10)
 
         assert not os.path.exists(mock_log_dir_inst.location)
-
-
-def test_flush_queue_is_thread_safe():
-    """
-    Autologging augments TensorBoard event logging hooks with MLflow `log_metric` API
-    calls. To prevent these API calls from blocking TensorBoard event logs, `log_metric`
-    API calls are scheduled via `_flush_queue` on a background thread. Accordingly, this test
-    verifies that `_flush_queue` is thread safe.
-    """
-    from threading import Thread
-    from mlflow.entities import Metric
-    from mlflow.tensorflow import _flush_queue, _metric_queue_lock
-
-    client = MlflowClient()
-    run = client.create_run(experiment_id="0")
-    metric_queue_item = (run.info.run_id, Metric("foo", 0.1, 100, 1))
-    mlflow.tensorflow._metric_queue.append(metric_queue_item)
-
-    # Verify that, if another thread holds a lock on the metric queue leveraged by
-    # _flush_queue, _flush_queue terminates and does not modify the queue
-    _metric_queue_lock.acquire()
-    flush_thread1 = Thread(target=_flush_queue)
-    flush_thread1.start()
-    flush_thread1.join()
-    assert len(mlflow.tensorflow._metric_queue) == 1
-    assert mlflow.tensorflow._metric_queue[0] == metric_queue_item
-    _metric_queue_lock.release()
-
-    # Verify that, if no other thread holds a lock on the metric queue leveraged by
-    # _flush_queue, _flush_queue flushes the queue as expected
-    flush_thread2 = Thread(target=_flush_queue)
-    flush_thread2.start()
-    flush_thread2.join()
-    assert len(mlflow.tensorflow._metric_queue) == 0
 
 
 def get_text_vec_model(train_samples):
@@ -832,7 +1047,7 @@ def get_text_vec_model(train_samples):
         "https://github.com/tensorflow/tensorflow/issues/38250"
     ),
 )
-def test_autolog_text_vec_model(tmpdir):
+def test_autolog_text_vec_model(tmp_path):
     """
     Verifies autolog successfully saves a model that can't be saved in the H5 format
     """
@@ -844,7 +1059,7 @@ def test_autolog_text_vec_model(tmpdir):
 
     # Saving in the H5 format should fail
     with pytest.raises(NotImplementedError, match="is not supported in h5"):
-        model.save(tmpdir.join("model.h5").strpath, save_format="h5")
+        model.save(str(tmp_path.joinpath("model.h5")), save_format="h5")
 
     with mlflow.start_run() as run:
         model.fit(train_samples, train_labels, epochs=1)
@@ -937,7 +1152,7 @@ def test_fluent_autolog_with_tf_keras_preserves_v2_model_reference():
 def test_import_tensorflow_with_fluent_autolog_enables_tensorflow_autologging():
     mlflow.autolog()
 
-    import tensorflow  # pylint: disable=unused-import,reimported
+    import tensorflow  # pylint: disable=reimported  # noqa: F401
 
     assert not autologging_is_disabled(mlflow.tensorflow.FLAVOR_NAME)
 

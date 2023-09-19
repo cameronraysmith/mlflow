@@ -8,42 +8,43 @@ ONNX (native) format
     Produced for use by generic pyfunc-based deployment tools and batch inference.
 """
 import os
-import yaml
-import numpy as np
 from pathlib import Path
+from typing import Any, Dict, Optional
+
+import numpy as np
+import pandas as pd
+import yaml
 from packaging.version import Version
 
-import pandas as pd
-
-from mlflow import pyfunc
-from mlflow.models import Model
-from mlflow.models.model import MLMODEL_FILE_NAME
 import mlflow.tracking
+from mlflow import pyfunc
 from mlflow.exceptions import MlflowException
-from mlflow.models.signature import ModelSignature
-from mlflow.models.utils import ModelInputExample, _save_example
+from mlflow.models import Model, ModelInputExample, ModelSignature
+from mlflow.models.model import MLMODEL_FILE_NAME
+from mlflow.models.utils import _save_example
+from mlflow.tracking._model_registry import DEFAULT_AWAIT_MAX_SLEEP_SECONDS
 from mlflow.tracking.artifact_utils import _download_artifact_from_uri
+from mlflow.utils.docstring_utils import LOG_MODEL_PARAM_DOCS, format_docstring
 from mlflow.utils.environment import (
-    _mlflow_conda_env,
-    _validate_env_arguments,
-    _process_pip_requirements,
-    _process_conda_env,
     _CONDA_ENV_FILE_NAME,
-    _REQUIREMENTS_FILE_NAME,
     _CONSTRAINTS_FILE_NAME,
     _PYTHON_ENV_FILE_NAME,
+    _REQUIREMENTS_FILE_NAME,
+    _mlflow_conda_env,
+    _process_conda_env,
+    _process_pip_requirements,
     _PythonEnv,
+    _validate_env_arguments,
 )
-from mlflow.utils.requirements_utils import _get_pinned_requirement
 from mlflow.utils.file_utils import write_to
-from mlflow.utils.docstring_utils import format_docstring, LOG_MODEL_PARAM_DOCS
 from mlflow.utils.model_utils import (
+    _add_code_from_conf_to_system_path,
     _get_flavor_configuration,
     _validate_and_copy_code_paths,
-    _add_code_from_conf_to_system_path,
     _validate_and_prepare_target_save_path,
+    _validate_onnx_session_options,
 )
-from mlflow.tracking._model_registry import DEFAULT_AWAIT_MAX_SLEEP_SECONDS
+from mlflow.utils.requirements_utils import _get_pinned_requirement
 
 FLAVOR_NAME = "onnx"
 ONNX_EXECUTION_PROVIDERS = ["CUDAExecutionProvider", "CPUExecutionProvider"]
@@ -89,6 +90,7 @@ def save_model(
     pip_requirements=None,
     extra_pip_requirements=None,
     onnx_execution_providers=None,
+    onnx_session_options=None,
     metadata=None,
 ):
     """
@@ -111,7 +113,7 @@ def save_model(
 
                       .. code-block:: python
 
-                        from mlflow.models.signature import infer_signature
+                        from mlflow.models import infer_signature
 
                         train = df.drop_column("target_label")
                         predictions = ...  # compute model predictions
@@ -130,6 +132,17 @@ def save_model(
                                      This uses GPU preferentially over CPU.
                                      See onnxruntime API for further descriptions:
                                      https://onnxruntime.ai/docs/execution-providers/
+    :param onnx_session_options: Dictionary of options to be passed to onnxruntime.InferenceSession.
+                                 For example:
+                                 ``{
+                                 'graph_optimization_level': 99,
+                                 'intra_op_num_threads': 1,
+                                 'inter_op_num_threads': 1,
+                                 'execution_mode': 'sequential'
+                                 }``
+                                 'execution_mode' can be set to 'sequential' or 'parallel'.
+                                 See onnxruntime API for further descriptions:
+                                 https://onnxruntime.ai/docs/api/python/api_summary.html#sessionoptions
     :param metadata: Custom metadata dictionary passed to the model and stored in the MLmodel file.
 
                      .. Note:: Experimental: This parameter may change or be removed in a future
@@ -171,11 +184,15 @@ def save_model(
         python_env=_PYTHON_ENV_FILE_NAME,
         code=code_dir_subpath,
     )
+
+    _validate_onnx_session_options(onnx_session_options)
+
     mlflow_model.add_flavor(
         FLAVOR_NAME,
         onnx_version=onnx.__version__,
         data=model_data_subpath,
         providers=onnx_execution_providers,
+        onnx_session_options=onnx_session_options,
         code=code_dir_subpath,
     )
     mlflow_model.save(os.path.join(path, MLMODEL_FILE_NAME))
@@ -218,9 +235,7 @@ def _load_model(model_file):
     import onnx
 
     onnx.checker.check_model(model_file)
-    onnx_model = onnx.load(model_file)
-    # Check Formation
-    return onnx_model
+    return onnx.load(model_file)
 
 
 class _OnnxModelWrapper:
@@ -238,6 +253,26 @@ class _OnnxModelWrapper:
         # If not, then default to the predefined list.
         else:
             providers = ONNX_EXECUTION_PROVIDERS
+
+        sess_options = onnxruntime.SessionOptions()
+        options = model_meta.flavors.get(FLAVOR_NAME).get("onnx_session_options")
+        if options:
+            if inter_op_num_threads := options.get("inter_op_num_threads"):
+                sess_options.inter_op_num_threads = inter_op_num_threads
+            if intra_op_num_threads := options.get("intra_op_num_threads"):
+                sess_options.intra_op_num_threads = intra_op_num_threads
+            if execution_mode := options.get("execution_mode"):
+                if execution_mode.upper() == "SEQUENTIAL":
+                    sess_options.execution_mode = onnxruntime.ExecutionMode.ORT_SEQUENTIAL
+                elif execution_mode.upper() == "PARALLEL":
+                    sess_options.execution_mode = onnxruntime.ExecutionMode.ORT_PARALLEL
+            if graph_optimization_level := options.get("graph_optimization_level"):
+                sess_options.graph_optimization_level = onnxruntime.GraphOptimizationLevel(
+                    graph_optimization_level
+                )
+            if extra_session_config := options.get("extra_session_config"):
+                for key, value in extra_session_config.items():
+                    sess_options.add_session_config_entry(key, value)
 
         # NOTE: Some distributions of onnxruntime require the specification of the providers
         # argument on calling. E.g. onnxruntime-gpu. The package import call does not differentiate
@@ -262,9 +297,11 @@ class _OnnxModelWrapper:
         #
 
         try:
-            self.rt = onnxruntime.InferenceSession(path)
+            self.rt = onnxruntime.InferenceSession(path, sess_options=sess_options)
         except ValueError:
-            self.rt = onnxruntime.InferenceSession(path, providers=providers)
+            self.rt = onnxruntime.InferenceSession(
+                path, providers=providers, sess_options=sess_options
+            )
 
         assert len(self.rt.get_inputs()) >= 1
         self.inputs = [(inp.name, inp.type) for inp in self.rt.get_inputs()]
@@ -278,7 +315,9 @@ class _OnnxModelWrapper:
                     feeds[input_name] = feed.astype(np.float32)
         return feeds
 
-    def predict(self, data):
+    def predict(
+        self, data, params: Optional[Dict[str, Any]] = None
+    ):  # pylint: disable=unused-argument
         """
         :param data: Either a pandas DataFrame, numpy.ndarray or a dictionary.
 
@@ -298,6 +337,10 @@ class _OnnxModelWrapper:
 
                       For more information about the ONNX Runtime, see
                       `<https://github.com/microsoft/onnxruntime>`_.
+        :param params: Additional parameters to pass to the model for inference.
+
+                       .. Note:: Experimental: This parameter may change or be removed in a future
+                                               release without warning.
         :return: Model predictions. If the input is a pandas.DataFrame, the predictions are returned
                  in a pandas.DataFrame. If the input is a numpy array or a dictionary the
                  predictions are returned in a dictionary.
@@ -315,9 +358,9 @@ class _OnnxModelWrapper:
                     "input. "
                     "Numpy arrays can only be used as input for MLflow ONNX "
                     "models that have a single input. This model requires "
-                    "{} inputs. Please pass in data as either a "
+                    f"{len(self.inputs)} inputs. Please pass in data as either a "
                     "dictionary or a DataFrame with the following tensors"
-                    ": {}.".format(len(self.inputs), inputs)
+                    f": {inputs}."
                 )
             feed_dict = {self.inputs[0][0]: data}
         elif isinstance(data, pd.DataFrame):
@@ -329,7 +372,7 @@ class _OnnxModelWrapper:
         else:
             raise TypeError(
                 "Input should be a dictionary or a numpy array or a pandas.DataFrame, "
-                "got '{}'".format(type(data))
+                f"got '{type(data)}'"
             )
 
         # ONNXRuntime throws the following exception for some operators when the input
@@ -349,10 +392,9 @@ class _OnnxModelWrapper:
                 data = np.asarray(data)
                 return data.reshape(-1)
 
-            response = pd.DataFrame.from_dict(
+            return pd.DataFrame.from_dict(
                 {c: format_output(p) for (c, p) in zip(self.output_names, predicted)}
             )
-            return response
         else:
             return dict(zip(self.output_names, predicted))
 
@@ -407,6 +449,7 @@ def log_model(
     pip_requirements=None,
     extra_pip_requirements=None,
     onnx_execution_providers=None,
+    onnx_session_options=None,
     metadata=None,
 ):
     """
@@ -431,7 +474,7 @@ def log_model(
 
                       .. code-block:: python
 
-                        from mlflow.models.signature import infer_signature
+                        from mlflow.models import infer_signature
 
                         train = df.drop_column("target_label")
                         predictions = ...  # compute model predictions
@@ -453,6 +496,17 @@ def log_model(
                                      This uses GPU preferentially over CPU.
                                      See onnxruntime API for further descriptions:
                                      https://onnxruntime.ai/docs/execution-providers/
+    :param onnx_session_options: Dictionary of options to be passed to onnxruntime.InferenceSession.
+                                 For example:
+                                 ``{
+                                 'graph_optimization_level': 99,
+                                 'intra_op_num_threads': 1,
+                                 'inter_op_num_threads': 1,
+                                 'execution_mode': 'sequential'
+                                 }``
+                                 'execution_mode' can be set to 'sequential' or 'parallel'.
+                                 See onnxruntime API for further descriptions:
+                                 https://onnxruntime.ai/docs/api/python/api_summary.html#sessionoptions
     :param metadata: Custom metadata dictionary passed to the model and stored in the MLmodel file.
 
                      .. Note:: Experimental: This parameter may change or be removed in a future
@@ -473,5 +527,6 @@ def log_model(
         pip_requirements=pip_requirements,
         extra_pip_requirements=extra_pip_requirements,
         onnx_execution_providers=onnx_execution_providers,
+        onnx_session_options=onnx_session_options,
         metadata=metadata,
     )

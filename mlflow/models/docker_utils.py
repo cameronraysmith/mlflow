@@ -1,13 +1,12 @@
-import os
-from subprocess import Popen, PIPE, STDOUT
-from urllib.parse import urlparse
 import logging
+import os
+from subprocess import PIPE, STDOUT, Popen
+from urllib.parse import urlparse
 
-import mlflow
-import mlflow.version
+from mlflow.utils import env_manager as em
 from mlflow.utils.file_utils import TempDir, _copy_project
 from mlflow.utils.logging_utils import eprint
-from mlflow.utils import env_manager as em
+from mlflow.version import VERSION
 
 _logger = logging.getLogger(__name__)
 
@@ -27,7 +26,7 @@ RUN apt-get install -y \
     libncursesw5-dev xz-utils tk-dev libxml2-dev libxmlsec1-dev libffi-dev liblzma-dev
 RUN git clone \
     --depth 1 \
-    --branch $(git ls-remote --tags https://github.com/pyenv/pyenv.git | grep -o -E 'v[1-9]+(\.[1-9]+)+$' | tail -1) \
+    --branch $(git ls-remote --tags --sort=v:refname https://github.com/pyenv/pyenv.git | grep -o -E 'v[1-9]+(\.[1-9]+)+$' | tail -1) \
     https://github.com/pyenv/pyenv.git /root/.pyenv
 ENV PYENV_ROOT="/root/.pyenv"
 ENV PATH="$PYENV_ROOT/bin:$PATH"
@@ -75,8 +74,6 @@ def _get_maven_proxy():
         )
     )
 
-
-DISABLE_ENV_CREATION = "MLFLOW_DISABLE_ENV_CREATION"
 
 _DOCKERFILE_TEMPLATE = """
 # Build an image that can serve mlflow models.
@@ -136,20 +133,20 @@ def _get_mlflow_install_step(dockerfile_context_dir, mlflow_home):
         )
     else:
         return (
-            "RUN pip install mlflow=={version}\n"
+            f"RUN pip install mlflow=={VERSION}\n"
             "RUN mvn"
             " --batch-mode dependency:copy"
-            " -Dartifact=org.mlflow:mlflow-scoring:{version}:pom"
-            " -DoutputDirectory=/opt/java {maven_proxy}\n"
+            f" -Dartifact=org.mlflow:mlflow-scoring:{VERSION}:pom"
+            f" -DoutputDirectory=/opt/java {maven_proxy}\n"
             "RUN mvn"
             " --batch-mode dependency:copy"
-            " -Dartifact=org.mlflow:mlflow-scoring:{version}:jar"
-            " -DoutputDirectory=/opt/java/jars {maven_proxy}\n"
-            "RUN cp /opt/java/mlflow-scoring-{version}.pom /opt/java/pom.xml\n"
+            f" -Dartifact=org.mlflow:mlflow-scoring:{VERSION}:jar"
+            f" -DoutputDirectory=/opt/java/jars {maven_proxy}\n"
+            f"RUN cp /opt/java/mlflow-scoring-{VERSION}.pom /opt/java/pom.xml\n"
             "RUN cd /opt/java && mvn "
             "--batch-mode dependency:copy-dependencies "
-            "-DoutputDirectory=/opt/java/jars {maven_proxy}\n"
-        ).format(version=mlflow.version.VERSION, maven_proxy=maven_proxy)
+            f"-DoutputDirectory=/opt/java/jars {maven_proxy}\n"
+        )
 
 
 def _generate_dockerfile_content(

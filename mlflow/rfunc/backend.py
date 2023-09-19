@@ -2,10 +2,11 @@ import logging
 import os
 import re
 import subprocess
+import sys
 
 from mlflow.models import FlavorBackend
-from mlflow.utils.string_utils import quote
 from mlflow.tracking.artifact_utils import _download_artifact_from_uri
+from mlflow.utils.string_utils import quote
 
 _logger = logging.getLogger(__name__)
 
@@ -101,7 +102,6 @@ class RFuncBackend(FlavorBackend):
 
 def _execute(command):
     env = os.environ.copy()
-    import sys
 
     process = subprocess.Popen(
         ["Rscript", "-e", command],
@@ -116,4 +116,4 @@ def _execute(command):
 
 
 def _str_optional(s):
-    return "NULL" if s is None else "'{}'".format(quote(str(s)))
+    return "NULL" if s is None else f"'{quote(str(s))}'"

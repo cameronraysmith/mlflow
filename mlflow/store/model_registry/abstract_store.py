@@ -1,4 +1,5 @@
-from abc import abstractmethod, ABCMeta
+from abc import ABCMeta, abstractmethod
+
 from mlflow.utils.annotations import developer_stable
 
 
@@ -10,10 +11,16 @@ class AbstractStore:
 
     __metaclass__ = ABCMeta
 
-    def __init__(self):
+    def __init__(self, store_uri=None, tracking_uri=None):
         """
         Empty constructor. This is deliberately not marked as abstract, else every derived class
         would be forced to create one.
+
+        :param store_uri: The model registry store URI
+        :param tracking_uri: URI of the current MLflow tracking server, used to perform operations
+                             like fetching source run metadata or downloading source run artifacts
+                             to support subsequently uploading them to the model registry storage
+                             location
         """
         pass
 
@@ -134,7 +141,14 @@ class AbstractStore:
 
     @abstractmethod
     def create_model_version(
-        self, name, source, run_id=None, tags=None, run_link=None, description=None
+        self,
+        name,
+        source,
+        run_id=None,
+        tags=None,
+        run_link=None,
+        description=None,
+        local_model_path=None,
     ):
         """
         Create a new model version from given source and run ID.
@@ -146,6 +160,12 @@ class AbstractStore:
                      instances associated with this model version.
         :param run_link: Link to the run from an MLflow tracking server that generated this model.
         :param description: Description of the version.
+        :param local_model_path: Local path to the MLflow model, if it's already accessible
+                                 on the local filesystem. Can be used by AbstractStores that
+                                 upload model version files to the model registry to avoid
+                                 a redundant download from the source location when logging
+                                 and registering a model via a single
+                                 mlflow.<flavor>.log_model(..., registered_model_name) call
         :return: A single object of :py:class:`mlflow.entities.model_registry.ModelVersion`
                  created in the backend.
         """
@@ -256,5 +276,39 @@ class AbstractStore:
         :param version: Registered model version.
         :param key: Tag key.
         :return: None
+        """
+        pass
+
+    @abstractmethod
+    def set_registered_model_alias(self, name, alias, version):
+        """
+        Set a registered model alias pointing to a model version.
+
+        :param name: Registered model name.
+        :param alias: Name of the alias.
+        :param version: Registered model version number.
+        :return: None
+        """
+        pass
+
+    @abstractmethod
+    def delete_registered_model_alias(self, name, alias):
+        """
+        Delete an alias associated with a registered model.
+
+        :param name: Registered model name.
+        :param alias: Name of the alias.
+        :return: None
+        """
+        pass
+
+    @abstractmethod
+    def get_model_version_by_alias(self, name, alias):
+        """
+        Get the model version instance by name and alias.
+
+        :param name: Registered model name.
+        :param alias: Name of the alias.
+        :return: A single :py:class:`mlflow.entities.model_registry.ModelVersion` object.
         """
         pass

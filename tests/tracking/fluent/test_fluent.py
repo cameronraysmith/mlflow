@@ -1,22 +1,21 @@
+import json
+import os
+import random
+import time
+import uuid
 from collections import defaultdict
 from importlib import reload
 from itertools import zip_longest
-
-from mlflow.store.model_registry import SEARCH_REGISTERED_MODEL_MAX_RESULTS_DEFAULT
-from mlflow.store.tracking import SEARCH_MAX_RESULTS_DEFAULT
-
-import os
-import random
-import uuid
-import inspect
-
-import pytest
 from unittest import mock
 
+import pandas as pd
+import pytest
+
 import mlflow
-from mlflow import MlflowClient
 import mlflow.tracking.context.registry
 import mlflow.tracking.fluent
+from mlflow import MlflowClient
+from mlflow.data.pandas_dataset import from_pandas
 from mlflow.entities import (
     LifecycleStage,
     Metric,
@@ -29,46 +28,29 @@ from mlflow.entities import (
     SourceType,
     ViewType,
 )
+from mlflow.environment_variables import (
+    MLFLOW_EXPERIMENT_ID,
+    MLFLOW_EXPERIMENT_NAME,
+    MLFLOW_RUN_ID,
+)
 from mlflow.exceptions import MlflowException
 from mlflow.store.entities.paged_list import PagedList
+from mlflow.store.model_registry import (
+    SEARCH_REGISTERED_MODEL_MAX_RESULTS_DEFAULT,
+)
+from mlflow.store.tracking import SEARCH_MAX_RESULTS_DEFAULT
 from mlflow.tracking.fluent import (
-    _EXPERIMENT_ID_ENV_VAR,
-    _EXPERIMENT_NAME_ENV_VAR,
-    _RUN_ID_ENV_VAR,
     _get_experiment_id,
     _get_experiment_id_from_env,
+    get_run,
     search_runs,
     set_experiment,
     start_run,
-    get_run,
 )
-from mlflow.utils import mlflow_tags, get_results_from_paginated_fn
-from mlflow.utils.file_utils import TempDir
-from mlflow.utils.time_utils import get_current_time_millis
+from mlflow.utils import get_results_from_paginated_fn, mlflow_tags
+from mlflow.utils.time import get_current_time_millis
 
 from tests.helper_functions import multi_context
-
-
-class HelperEnv:
-    def __init__(self):
-        pass
-
-    @classmethod
-    def assert_values(cls, exp_id, name):
-        assert os.environ.get(_EXPERIMENT_NAME_ENV_VAR) == name
-        assert os.environ.get(_EXPERIMENT_ID_ENV_VAR) == exp_id
-
-    @classmethod
-    def set_values(cls, experiment_id=None, name=None):
-        if experiment_id:
-            os.environ[_EXPERIMENT_ID_ENV_VAR] = str(experiment_id)
-        elif os.environ.get(_EXPERIMENT_ID_ENV_VAR):
-            del os.environ[_EXPERIMENT_ID_ENV_VAR]
-
-        if name:
-            os.environ[_EXPERIMENT_NAME_ENV_VAR] = str(name)
-        elif os.environ.get(_EXPERIMENT_NAME_ENV_VAR):
-            del os.environ[_EXPERIMENT_NAME_ENV_VAR]
 
 
 def create_run(
@@ -167,7 +149,6 @@ def reset_experiment_id():
     its included
     """
     yield
-    HelperEnv.set_values()
     mlflow.tracking.fluent._active_experiment_id = None
 
 
@@ -184,108 +165,93 @@ def search_runs_output_format(request):
     return request.param
 
 
-def test_all_fluent_apis_are_included_in_dunder_all():
-    def _is_function_or_class(obj):
-        return callable(obj) or inspect.isclass(obj)
-
-    apis = [
-        a
-        for a in dir(mlflow)
-        if _is_function_or_class(getattr(mlflow, a)) and not a.startswith("_")
-    ]
-    assert set(apis).issubset(set(mlflow.__all__))
-
-
-def test_get_experiment_id_from_env():
+def test_get_experiment_id_from_env(monkeypatch):
     # When no env variables are set
-    HelperEnv.assert_values(None, None)
+    assert not MLFLOW_EXPERIMENT_NAME.defined
+    assert not MLFLOW_EXPERIMENT_ID.defined
     assert _get_experiment_id_from_env() is None
 
     # set only ID
-    with TempDir(chdr=True):
-        name = "random experiment %d" % random.randint(1, 1e6)
-        exp_id = mlflow.create_experiment(name)
-        assert exp_id is not None
-        HelperEnv.set_values(experiment_id=exp_id)
-        HelperEnv.assert_values(exp_id, None)
-        assert _get_experiment_id_from_env() == exp_id
+    name = f"random experiment {random.randint(1, 1e6)}"
+    exp_id = mlflow.create_experiment(name)
+    assert exp_id is not None
+    monkeypatch.delenv(MLFLOW_EXPERIMENT_NAME.name, raising=False)
+    monkeypatch.setenv(MLFLOW_EXPERIMENT_ID.name, exp_id)
+    assert _get_experiment_id_from_env() == exp_id
 
     # set only name
-    with TempDir(chdr=True):
-        name = "random experiment %d" % random.randint(1, 1e6)
-        exp_id = mlflow.create_experiment(name)
-        assert exp_id is not None
-        HelperEnv.set_values(name=name)
-        HelperEnv.assert_values(None, name)
-        assert _get_experiment_id_from_env() == exp_id
+    name = f"random experiment {random.randint(1, 1e6)}"
+    exp_id = mlflow.create_experiment(name)
+    assert exp_id is not None
+    monkeypatch.delenv(MLFLOW_EXPERIMENT_ID.name, raising=False)
+    monkeypatch.setenv(MLFLOW_EXPERIMENT_NAME.name, name)
+    assert _get_experiment_id_from_env() == exp_id
 
     # create experiment from env name
-    with TempDir(chdr=True):
-        name = "random experiment %d" % random.randint(1, 1e6)
-        HelperEnv.set_values(name=name)
-        HelperEnv.assert_values(None, name)
-        assert MlflowClient().get_experiment_by_name(name) is None
-        assert _get_experiment_id_from_env() is not None
+    name = f"random experiment {random.randint(1, 1e6)}"
+    monkeypatch.delenv(MLFLOW_EXPERIMENT_ID.name, raising=False)
+    monkeypatch.setenv(MLFLOW_EXPERIMENT_NAME.name, name)
+    assert MlflowClient().get_experiment_by_name(name) is None
+    assert _get_experiment_id_from_env() is not None
 
     # assert experiment creation from encapsulating function
-    with TempDir(chdr=True):
-        name = "random experiment %d" % random.randint(1, 1e6)
-        HelperEnv.set_values(name=name)
-        HelperEnv.assert_values(None, name)
-        assert MlflowClient().get_experiment_by_name(name) is None
-        assert _get_experiment_id() is not None
+    name = f"random experiment {random.randint(1, 1e6)}"
+    monkeypatch.delenv(MLFLOW_EXPERIMENT_ID.name, raising=False)
+    monkeypatch.setenv(MLFLOW_EXPERIMENT_NAME.name, name)
+    assert MlflowClient().get_experiment_by_name(name) is None
+    assert _get_experiment_id() is not None
 
     # assert raises from conflicting experiment_ids
-    with TempDir(chdr=True):
-        name = "random experiment %d" % random.randint(1, 1e6)
-        exp_id = mlflow.create_experiment(name)
-        random_id = random.randint(100, 1e6)
-        assert exp_id != random_id
-        HelperEnv.set_values(experiment_id=random_id)
-        HelperEnv.assert_values(str(random_id), None)
-        with pytest.raises(
-            MlflowException,
-            match=f"The provided {_EXPERIMENT_ID_ENV_VAR} environment variable value `{random_id}` "
-            "does not exist in the tracking server",
-        ):
-            _get_experiment_id_from_env()
+    name = f"random experiment {random.randint(1, 1e6)}"
+    exp_id = mlflow.create_experiment(name)
+    random_id = random.randint(100, 1e6)
+    assert exp_id != random_id
+    monkeypatch.delenv(MLFLOW_EXPERIMENT_NAME.name, raising=False)
+    monkeypatch.setenv(MLFLOW_EXPERIMENT_ID.name, random_id)
+    with pytest.raises(
+        MlflowException,
+        match=(
+            f"The provided {MLFLOW_EXPERIMENT_ID} environment variable value "
+            f"`{random_id}` does not exist in the tracking server"
+        ),
+    ):
+        _get_experiment_id_from_env()
 
     # assert raises from name to id mismatch
-    with TempDir(chdr=True):
-        name = "random experiment %d" % random.randint(1, 1e6)
-        exp_id = mlflow.create_experiment(name)
-        random_id = random.randint(100, 1e6)
-        assert exp_id != random_id
-        HelperEnv.set_values(experiment_id=random_id, name=name)
-        HelperEnv.assert_values(str(random_id), name)
-        with pytest.raises(
-            MlflowException,
-            match=f"The provided {_EXPERIMENT_ID_ENV_VAR} environment variable value `{random_id}` "
-            "does not match the experiment id",
-        ):
-            _get_experiment_id_from_env()
+    name = f"random experiment {random.randint(1, 1e6)}"
+    exp_id = mlflow.create_experiment(name)
+    random_id = random.randint(100, 1e6)
+    assert exp_id != random_id
+    monkeypatch.setenvs({MLFLOW_EXPERIMENT_ID.name: random_id, MLFLOW_EXPERIMENT_NAME.name: name})
+    with pytest.raises(
+        MlflowException,
+        match=(
+            f"The provided {MLFLOW_EXPERIMENT_ID} environment variable value "
+            f"`{random_id}` does not match the experiment id"
+        ),
+    ):
+        _get_experiment_id_from_env()
 
     # assert does not raise if active experiment is set with invalid env variables
-    with TempDir(chdr=True):
-        invalid_name = "invalid experiment"
-        name = "random experiment %d" % random.randint(1, 1e6)
-        exp_id = mlflow.create_experiment(name)
-        assert exp_id is not None
-        random_id = random.randint(100, 1e6)
-        HelperEnv.set_values(name=invalid_name, experiment_id=random_id)
-        HelperEnv.assert_values(str(random_id), invalid_name)
-        mlflow.set_experiment(experiment_id=exp_id)
-        assert _get_experiment_id() == exp_id
+    invalid_name = "invalid experiment"
+    name = f"random experiment {random.randint(1, 1e6)}"
+    exp_id = mlflow.create_experiment(name)
+    assert exp_id is not None
+    random_id = random.randint(100, 1e6)
+    monkeypatch.setenvs(
+        {MLFLOW_EXPERIMENT_ID.name: random_id, MLFLOW_EXPERIMENT_NAME.name: invalid_name}
+    )
+    mlflow.set_experiment(experiment_id=exp_id)
+    assert _get_experiment_id() == exp_id
 
 
 def test_get_experiment_id_with_active_experiment_returns_active_experiment_id():
     # Create a new experiment and set that as active experiment
-    with TempDir(chdr=True):
-        name = "Random experiment %d" % random.randint(1, 1e6)
-        exp_id = mlflow.create_experiment(name)
-        assert exp_id is not None
-        mlflow.set_experiment(name)
-        assert _get_experiment_id() == exp_id
+    name = f"Random experiment {random.randint(1, 1e6)}"
+    exp_id = mlflow.create_experiment(name)
+    assert exp_id is not None
+    mlflow.set_experiment(name)
+    assert _get_experiment_id() == exp_id
 
 
 def test_get_experiment_id_with_no_active_experiments_returns_zero():
@@ -296,74 +262,76 @@ def test_get_experiment_id_in_databricks_detects_notebook_id_by_default():
     notebook_id = 768
 
     with mock.patch(
-        "mlflow.tracking.fluent.default_experiment_registry.get_experiment_id"
-    ) as notebook_id_mock:
-        notebook_id_mock.return_value = notebook_id
+        "mlflow.tracking.fluent.default_experiment_registry.get_experiment_id",
+        return_value=notebook_id,
+    ):
         assert _get_experiment_id() == notebook_id
 
 
 def test_get_experiment_id_in_databricks_with_active_experiment_returns_active_experiment_id():
-    with TempDir(chdr=True):
-        exp_name = "random experiment %d" % random.randint(1, 1e6)
-        exp_id = mlflow.create_experiment(exp_name)
-        mlflow.set_experiment(exp_name)
-        notebook_id = str(int(exp_id) + 73)
+    exp_name = f"random experiment {random.randint(1, 1e6)}"
+    exp_id = mlflow.create_experiment(exp_name)
+    mlflow.set_experiment(exp_name)
+    notebook_id = str(int(exp_id) + 73)
 
     with mock.patch(
-        "mlflow.tracking.fluent.default_experiment_registry.get_experiment_id"
-    ) as notebook_id_mock:
-        notebook_id_mock.return_value = notebook_id
-
+        "mlflow.tracking.fluent.default_experiment_registry.get_experiment_id",
+        return_value=notebook_id,
+    ):
         assert _get_experiment_id() != notebook_id
         assert _get_experiment_id() == exp_id
 
 
-def test_get_experiment_id_in_databricks_with_experiment_defined_in_env_returns_env_experiment_id():
-    with TempDir(chdr=True):
-        exp_name = "random experiment %d" % random.randint(1, 1e6)
-        exp_id = mlflow.create_experiment(exp_name)
-        notebook_id = str(int(exp_id) + 73)
-        HelperEnv.set_values(experiment_id=exp_id)
+def test_get_experiment_id_in_databricks_with_experiment_defined_in_env_returns_env_experiment_id(
+    monkeypatch,
+):
+    exp_name = f"random experiment {random.randint(1, 1e6)}"
+    exp_id = mlflow.create_experiment(exp_name)
+    notebook_id = str(int(exp_id) + 73)
+    monkeypatch.delenv(MLFLOW_EXPERIMENT_NAME.name, raising=False)
+    monkeypatch.setenv(MLFLOW_EXPERIMENT_ID.name, exp_id)
 
     with mock.patch(
-        "mlflow.tracking.fluent.default_experiment_registry.get_experiment_id"
-    ) as notebook_id_mock:
-        notebook_id_mock.return_value = notebook_id
-
+        "mlflow.tracking.fluent.default_experiment_registry.get_experiment_id",
+        return_value=notebook_id,
+    ):
         assert _get_experiment_id() != notebook_id
         assert _get_experiment_id() == exp_id
 
 
 def test_get_experiment_by_id():
-    with TempDir(chdr=True):
-        name = "Random experiment %d" % random.randint(1, 1e6)
-        exp_id = mlflow.create_experiment(name)
+    name = f"Random experiment {random.randint(1, 1e6)}"
+    exp_id = mlflow.create_experiment(name)
 
-        experiment = mlflow.get_experiment(exp_id)
-        assert experiment.experiment_id == exp_id
+    experiment = mlflow.get_experiment(exp_id)
+    assert experiment.experiment_id == exp_id
 
 
 def test_get_experiment_by_id_with_is_in_databricks_job():
     job_exp_id = 123
     with mock.patch(
-        "mlflow.tracking.fluent.default_experiment_registry.get_experiment_id"
-    ) as job_id_mock:
-        job_id_mock.return_value = job_exp_id
+        "mlflow.tracking.fluent.default_experiment_registry.get_experiment_id",
+        return_value=job_exp_id,
+    ):
         assert _get_experiment_id() == job_exp_id
 
 
 def test_get_experiment_by_name():
-    with TempDir(chdr=True):
-        name = "Random experiment %d" % random.randint(1, 1e6)
-        exp_id = mlflow.create_experiment(name)
+    name = f"Random experiment {random.randint(1, 1e6)}"
+    exp_id = mlflow.create_experiment(name)
 
-        experiment = mlflow.get_experiment_by_name(name)
-        assert experiment.experiment_id == exp_id
+    experiment = mlflow.get_experiment_by_name(name)
+    assert experiment.experiment_id == exp_id
 
 
 def test_search_experiments(tmp_path):
     sqlite_uri = "sqlite:///{}".format(tmp_path.joinpath("test.db"))
     mlflow.set_tracking_uri(sqlite_uri)
+    # Why do we need this line? If we didn't have this line, the first `mlflow.create_experiment`
+    # call in the loop below would create two experiments, the default experiment (when the sqlite
+    # database is initialized) and another one with the specified name. They might have the same
+    # creation time, which makes the search order non-deterministic and this test flaky.
+    mlflow.search_experiments()
 
     num_all_experiments = SEARCH_MAX_RESULTS_DEFAULT + 1  # +1 for the default experiment
     num_active_experiments = SEARCH_MAX_RESULTS_DEFAULT // 2
@@ -372,10 +340,13 @@ def test_search_experiments(tmp_path):
     active_experiment_names = [f"active_{i}" for i in range(num_active_experiments)]
     tag_values = ["x", "x", "y"]
     for tag, active_experiment_name in zip_longest(tag_values, active_experiment_names):
+        # Sleep to ensure that each experiment has a different creation time
+        time.sleep(0.001)
         mlflow.create_experiment(active_experiment_name, tags={"tag": tag} if tag else None)
 
     deleted_experiment_names = [f"deleted_{i}" for i in range(num_deleted_experiments)]
     for deleted_experiment_name in deleted_experiment_names:
+        time.sleep(0.001)
         exp_id = mlflow.create_experiment(deleted_experiment_name)
         mlflow.delete_experiment(exp_id)
 
@@ -468,6 +439,65 @@ def test_search_registered_models(tmp_path):
     # Order by name
     models = mlflow.search_registered_models(order_by=["name DESC"], max_results=3)
     assert [m.name for m in models] == sorted(model_names, reverse=True)[:3]
+
+
+def test_search_model_versions(tmp_path):
+    sqlite_uri = "sqlite:///{}".format(tmp_path.joinpath("test.db"))
+    mlflow.set_tracking_uri(sqlite_uri)
+    max_results_default = 100
+    with mock.patch(
+        "mlflow.store.model_registry.SEARCH_MODEL_VERSION_MAX_RESULTS_DEFAULT",
+        max_results_default,
+    ):
+        num_all_model_versions = max_results_default + 1
+        num_a_model_versions = num_all_model_versions // 4
+        num_b_model_versions = num_all_model_versions - num_a_model_versions
+
+        a_model_version_names = ["AModel" for i in range(num_a_model_versions)]
+        b_model_version_names = ["BModel" for i in range(num_b_model_versions)]
+        model_version_names = b_model_version_names + a_model_version_names
+
+        MlflowClient().create_registered_model(name="AModel")
+        MlflowClient().create_registered_model(name="BModel")
+
+        tag_values = ["x", "x", "y"]
+        for tag, model_name in zip_longest(tag_values, model_version_names):
+            MlflowClient().create_model_version(
+                name=model_name, source="foo/bar", tags={"tag": tag} if tag else None
+            )
+
+        # max_results is unspecified
+        model_versions = mlflow.search_model_versions()
+        assert len(model_versions) == num_all_model_versions
+
+        # max_results is larger than the number of model versions in the database
+        model_versions = mlflow.search_model_versions(max_results=num_all_model_versions + 1)
+        assert len(model_versions) == num_all_model_versions
+
+        # max_results is equal to the number of model versions in the database
+        model_versions = mlflow.search_model_versions(max_results=num_all_model_versions)
+        assert len(model_versions) == num_all_model_versions
+        # max_results is smaller than the number of models in the database
+        model_versions = mlflow.search_model_versions(max_results=num_all_model_versions - 1)
+        assert len(model_versions) == num_all_model_versions - 1
+
+        # Filter by name
+        model_versions = mlflow.search_model_versions(filter_string="name = 'AModel'")
+        assert [m.name for m in model_versions] == a_model_version_names
+        model_versions = mlflow.search_model_versions(filter_string="name ILIKE 'bmodel'")
+        assert len(model_versions) == num_b_model_versions
+
+        # Filter by tags
+        model_versions = mlflow.search_model_versions(filter_string="tags.tag = 'x'")
+        assert [m.name for m in model_versions] == model_version_names[:2]
+        model_versions = mlflow.search_model_versions(filter_string="tags.tag = 'y'")
+        assert [m.name for m in model_versions] == [model_version_names[2]]
+
+        # Order by version_number
+        model_versions = mlflow.search_model_versions(
+            order_by=["version_number ASC"], max_results=5
+        )
+        assert [m.version for m in model_versions] == [1, 1, 2, 2, 3]
 
 
 @pytest.fixture
@@ -730,18 +760,16 @@ def test_start_run_existing_run(empty_active_run_stack):  # pylint: disable=unus
 
 
 def test_start_run_existing_run_from_environment(
-    empty_active_run_stack,
+    empty_active_run_stack, monkeypatch
 ):  # pylint: disable=unused-argument
     mock_run = mock.Mock()
     mock_run.info.lifecycle_stage = LifecycleStage.ACTIVE
 
     run_id = uuid.uuid4().hex
-    env_patch = mock.patch.dict("os.environ", {_RUN_ID_ENV_VAR: run_id})
+    monkeypatch.setenv(MLFLOW_RUN_ID.name, run_id)
     mock_get_store = mock.patch("mlflow.tracking.fluent._get_store")
 
-    with env_patch, mock_get_store, mock.patch.object(
-        MlflowClient, "get_run", return_value=mock_run
-    ):
+    with mock_get_store, mock.patch.object(MlflowClient, "get_run", return_value=mock_run):
         active_run = start_run()
 
         assert is_from_run(active_run, mock_run)
@@ -749,15 +777,14 @@ def test_start_run_existing_run_from_environment(
 
 
 def test_start_run_existing_run_from_environment_with_set_environment(
-    empty_active_run_stack,
+    empty_active_run_stack, monkeypatch
 ):  # pylint: disable=unused-argument
     mock_run = mock.Mock()
     mock_run.info.lifecycle_stage = LifecycleStage.ACTIVE
 
     run_id = uuid.uuid4().hex
-    env_patch = mock.patch.dict("os.environ", {_RUN_ID_ENV_VAR: run_id})
-
-    with env_patch, mock.patch.object(MlflowClient, "get_run", return_value=mock_run):
+    monkeypatch.setenv(MLFLOW_RUN_ID.name, run_id)
+    with mock.patch.object(MlflowClient, "get_run", return_value=mock_run):
         set_experiment("test-run")
         with pytest.raises(
             MlflowException, match="active run ID does not match environment run ID"
@@ -905,14 +932,12 @@ def validate_search_runs(results, data, output_format):
         data_subset = {k: data[k] for k in keys if k in keys}
         assert result_data == data_subset
     elif output_format == "pandas":
-        import pandas as pd
-
         expected_df = pd.DataFrame(data)
         expected_df["start_time"] = pd.to_datetime(expected_df["start_time"], unit="ms", utc=True)
         expected_df["end_time"] = pd.to_datetime(expected_df["end_time"], unit="ms", utc=True)
         pd.testing.assert_frame_equal(results, expected_df, check_like=True, check_frame_type=False)
     else:
-        raise Exception("Invalid output format %s" % output_format)
+        raise Exception(f"Invalid output format {output_format}")
 
 
 def test_search_runs_attributes(search_runs_output_format):
@@ -1192,3 +1217,74 @@ def test_set_experiment_tags():
     assert len(finished_experiment.tags) == len(exact_expected_tags)
     for tag_key, tag_value in finished_experiment.tags.items():
         assert str(exact_expected_tags[tag_key]) == tag_value
+
+
+def test_log_input(tmp_path):
+    df = pd.DataFrame([[1, 2, 3], [1, 2, 3]], columns=["a", "b", "c"])
+    path = tmp_path / "temp.csv"
+    df.to_csv(path)
+    dataset = from_pandas(df, source=path)
+    with start_run() as run:
+        mlflow.log_input(dataset, "train", {"foo": "baz"})
+    dataset_inputs = MlflowClient().get_run(run.info.run_id).inputs.dataset_inputs
+
+    assert len(dataset_inputs) == 1
+    assert dataset_inputs[0].dataset.name == "dataset"
+    assert dataset_inputs[0].dataset.digest == "f0f3e026"
+    assert dataset_inputs[0].dataset.source_type == "local"
+    assert json.loads(dataset_inputs[0].dataset.source) == {"uri": str(path)}
+    assert json.loads(dataset_inputs[0].dataset.schema) == {
+        "mlflow_colspec": [
+            {"name": "a", "type": "long"},
+            {"name": "b", "type": "long"},
+            {"name": "c", "type": "long"},
+        ]
+    }
+    assert json.loads(dataset_inputs[0].dataset.profile) == {"num_rows": 2, "num_elements": 6}
+
+    assert len(dataset_inputs[0].tags) == 2
+    assert dataset_inputs[0].tags[0].key == "foo"
+    assert dataset_inputs[0].tags[0].value == "baz"
+    assert dataset_inputs[0].tags[1].key == mlflow_tags.MLFLOW_DATASET_CONTEXT
+    assert dataset_inputs[0].tags[1].value == "train"
+
+    # ensure log_input also works without tags
+    with start_run() as run:
+        mlflow.log_input(dataset, "train")
+    dataset_inputs = MlflowClient().get_run(run.info.run_id).inputs.dataset_inputs
+
+    assert len(dataset_inputs) == 1
+    assert dataset_inputs[0].dataset.name == "dataset"
+    assert dataset_inputs[0].dataset.digest == "f0f3e026"
+    assert dataset_inputs[0].dataset.source_type == "local"
+    assert json.loads(dataset_inputs[0].dataset.source) == {"uri": str(path)}
+    assert json.loads(dataset_inputs[0].dataset.schema) == {
+        "mlflow_colspec": [
+            {"name": "a", "type": "long"},
+            {"name": "b", "type": "long"},
+            {"name": "c", "type": "long"},
+        ]
+    }
+    assert json.loads(dataset_inputs[0].dataset.profile) == {"num_rows": 2, "num_elements": 6}
+
+    assert len(dataset_inputs[0].tags) == 1
+    assert dataset_inputs[0].tags[0].key == mlflow_tags.MLFLOW_DATASET_CONTEXT
+    assert dataset_inputs[0].tags[0].value == "train"
+
+
+def test_get_parent_run():
+    with mlflow.start_run() as parent:
+        mlflow.log_param("a", 1)
+        mlflow.log_metric("b", 2.0)
+        with mlflow.start_run(nested=True) as child_run:
+            child_run_id = child_run.info.run_id
+
+    with mlflow.start_run() as run:
+        run_id = run.info.run_id
+
+    parent_run = mlflow.get_parent_run(child_run_id)
+    assert parent_run.info.run_id == parent.info.run_id
+    assert parent_run.data.metrics == {"b": 2.0}
+    assert parent_run.data.params == {"a": "1"}
+
+    assert mlflow.get_parent_run(run_id) is None

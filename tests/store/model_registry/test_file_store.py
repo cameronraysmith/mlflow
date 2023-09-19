@@ -1,7 +1,7 @@
 import time
 import uuid
+from typing import List, NamedTuple
 from unittest import mock
-from typing import NamedTuple, List
 
 import pytest
 
@@ -10,7 +10,8 @@ from mlflow.exceptions import MlflowException
 from mlflow.protos.databricks_pb2 import INVALID_PARAMETER_VALUE, RESOURCE_DOES_NOT_EXIST, ErrorCode
 from mlflow.store.model_registry.file_store import FileStore
 from mlflow.utils.file_utils import path_to_local_file_uri, write_yaml
-from mlflow.utils.time_utils import get_current_time_millis
+from mlflow.utils.time import get_current_time_millis
+
 from tests.helper_functions import random_int, random_str
 
 
@@ -103,7 +104,8 @@ def test_list_registered_model(store, registered_model_names, rm_data):
         assert name == rm_data[name]["name"]
 
 
-def test_rename_registered_model(store, registered_model_names, rm_data):
+@pytest.mark.usefixtures(rm_data.__name__)
+def test_rename_registered_model(store, registered_model_names):
     # Error cases
     model_name = registered_model_names[0]
     with pytest.raises(MlflowException, match=r"Registered model name cannot be empty\."):
@@ -125,7 +127,8 @@ def _extract_names(registered_models):
     return [rm.name for rm in registered_models]
 
 
-def test_delete_registered_model(store, registered_model_names, rm_data):
+@pytest.mark.usefixtures(rm_data.__name__)
+def test_delete_registered_model(store, registered_model_names):
     model_name = registered_model_names[random_int(0, len(registered_model_names) - 1)]
 
     # Error cases
@@ -671,7 +674,7 @@ def test_search_model_versions(store):
         return [mvd.version for mvd in _search_model_versions(store, filter_string)]
 
     # search using name should return all 4 versions
-    assert set(search_versions("name='%s'" % name)) == {1, 2, 3, 4}
+    assert set(search_versions(f"name='{name}'")) == {1, 2, 3, 4}
 
     # search using version
     assert set(search_versions("version_number=2")) == {2}
@@ -691,6 +694,11 @@ def test_search_model_versions(store):
 
     # search IN operator with right-hand side value containing whitespaces
     assert set(search_versions(f"run_id IN ('{run_id_1}', '{run_id_2}')")) == {1, 2, 3}
+
+    # search IN operator with other conditions
+    assert set(
+        search_versions(f"version_number=2 AND run_id IN ('{run_id_1.upper()}','{run_id_2}')")
+    ) == {2}
 
     # search using the IN operator with bad lists should return exceptions
     with pytest.raises(
@@ -785,7 +793,7 @@ def test_search_model_versions(store):
         name=mv1.name, version=mv1.version, description="Online prediction model!"
     )
 
-    mvds = store.search_model_versions("run_id = '%s'" % run_id_1, max_results=10)
+    mvds = store.search_model_versions(f"run_id = '{run_id_1}'", max_results=10)
     assert len(mvds) == 1
     assert isinstance(mvds[0], ModelVersion)
     assert mvds[0].current_stage == "Production"
@@ -1412,12 +1420,71 @@ def test_delete_model_version_tag(store):
     assert exception_context.value.error_code == ErrorCode.Name(INVALID_PARAMETER_VALUE)
 
 
+def _setup_and_test_aliases(store, model_name):
+    store.create_registered_model(model_name)
+    run_id_1 = uuid.uuid4().hex
+    run_id_2 = uuid.uuid4().hex
+    store.create_model_version(model_name, "v1", run_id_1)
+    store.create_model_version(model_name, "v2", run_id_2)
+    store.set_registered_model_alias(model_name, "test_alias", "2")
+    model = store.get_registered_model(model_name)
+    assert model.aliases == {"test_alias": "2"}
+    mv1 = store.get_model_version(model_name, 1)
+    mv2 = store.get_model_version(model_name, 2)
+    assert mv1.aliases == []
+    assert mv2.aliases == ["test_alias"]
+
+
+def test_set_registered_model_alias(store):
+    _setup_and_test_aliases(store, "SetRegisteredModelAlias_TestMod")
+
+
+def test_delete_registered_model_alias(store):
+    model_name = "DeleteRegisteredModelAlias_TestMod"
+    _setup_and_test_aliases(store, model_name)
+    store.delete_registered_model_alias(model_name, "test_alias")
+    model = store.get_registered_model(model_name)
+    assert model.aliases == {}
+    mv2 = store.get_model_version(model_name, 2)
+    assert mv2.aliases == []
+    with pytest.raises(MlflowException, match=r"Registered model alias test_alias not found."):
+        store.get_model_version_by_alias(model_name, "test_alias")
+
+
+def test_get_model_version_by_alias(store):
+    model_name = "GetModelVersionByAlias_TestMod"
+    _setup_and_test_aliases(store, model_name)
+    mv = store.get_model_version_by_alias(model_name, "test_alias")
+    assert mv.aliases == ["test_alias"]
+
+
+def test_delete_model_version_deletes_alias(store):
+    model_name = "DeleteModelVersionDeletesAlias_TestMod"
+    _setup_and_test_aliases(store, model_name)
+    store.delete_model_version(model_name, 2)
+    model = store.get_registered_model(model_name)
+    assert model.aliases == {}
+    with pytest.raises(MlflowException, match=r"Registered model alias test_alias not found."):
+        store.get_model_version_by_alias(model_name, "test_alias")
+
+
+def test_delete_model_deletes_alias(store):
+    model_name = "DeleteModelDeletesAlias_TestMod"
+    _setup_and_test_aliases(store, model_name)
+    store.delete_registered_model(model_name)
+    with pytest.raises(
+        MlflowException,
+        match=r"Registered Model with name=DeleteModelDeletesAlias_TestMod not found",
+    ):
+        store.get_model_version_by_alias(model_name, "test_alias")
+
+
 def test_pyfunc_model_registry_with_file_store(store):
     import mlflow
     from mlflow.pyfunc import PythonModel
 
     class MyModel(PythonModel):
-        def predict(self, context, model_input):
+        def predict(self, context, model_input, params=None):
             return 7
 
     mlflow.set_registry_uri(path_to_local_file_uri(store.root_directory))
@@ -1443,4 +1510,5 @@ def test_pyfunc_model_registry_with_file_store(store):
         assert len(mv1) == 2
         assert mv1[0].name == "model1"
         mv2 = store.search_model_versions("name = 'model2'", max_results=10)
-        assert len(mv2) == 1 and mv2[0].name == "model2"
+        assert len(mv2) == 1
+        assert mv2[0].name == "model2"

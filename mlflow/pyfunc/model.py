@@ -3,41 +3,46 @@ The ``mlflow.pyfunc.model`` module defines logic for saving and loading custom "
 models with a user-defined ``PythonModel`` subclass.
 """
 
+import inspect
+import logging
 import os
-import posixpath
 import shutil
-import yaml
 from abc import ABCMeta, abstractmethod
+from pathlib import Path
+from typing import Any, Dict, List, Optional
 
 import cloudpickle
+import yaml
 
 import mlflow.pyfunc
 import mlflow.utils
 from mlflow.exceptions import MlflowException
 from mlflow.models import Model
 from mlflow.models.model import MLMODEL_FILE_NAME
-from mlflow.protos.databricks_pb2 import INVALID_PARAMETER_VALUE
+from mlflow.models.signature import _extract_type_hints
 from mlflow.tracking.artifact_utils import _download_artifact_from_uri
 from mlflow.utils.environment import (
-    _mlflow_conda_env,
-    _process_pip_requirements,
-    _process_conda_env,
     _CONDA_ENV_FILE_NAME,
-    _REQUIREMENTS_FILE_NAME,
     _CONSTRAINTS_FILE_NAME,
     _PYTHON_ENV_FILE_NAME,
+    _REQUIREMENTS_FILE_NAME,
+    _mlflow_conda_env,
+    _process_conda_env,
+    _process_pip_requirements,
     _PythonEnv,
 )
-from mlflow.utils.requirements_utils import _get_pinned_requirement
-from mlflow.utils.file_utils import write_to
+from mlflow.utils.file_utils import TempDir, _copy_file_or_tree, write_to
 from mlflow.utils.model_utils import _get_flavor_configuration
-from mlflow.utils.file_utils import TempDir, _copy_file_or_tree
+from mlflow.utils.requirements_utils import _get_pinned_requirement
 
 CONFIG_KEY_ARTIFACTS = "artifacts"
 CONFIG_KEY_ARTIFACT_RELATIVE_PATH = "path"
 CONFIG_KEY_ARTIFACT_URI = "uri"
 CONFIG_KEY_PYTHON_MODEL = "python_model"
 CONFIG_KEY_CLOUDPICKLE_VERSION = "cloudpickle_version"
+
+
+_logger = logging.getLogger(__name__)
 
 
 def get_default_pip_requirements():
@@ -57,6 +62,14 @@ def get_default_conda_env():
              :class:`PythonModel` is provided.
     """
     return _mlflow_conda_env(additional_pip_deps=get_default_pip_requirements())
+
+
+def _log_warning_if_params_not_in_predict_signature(logger, params):
+    if params:
+        logger.warning(
+            "The underlying model does not support passing additional parameters to the predict"
+            f" function. `params` {params} will be ignored."
+        )
 
 
 class PythonModel:
@@ -84,8 +97,11 @@ class PythonModel:
                         can use to perform inference.
         """
 
+    def _get_type_hints(self):
+        return _extract_type_hints(self.predict, input_arg_index=1)
+
     @abstractmethod
-    def predict(self, context, model_input):
+    def predict(self, context, model_input, params: Optional[Dict[str, Any]] = None):
         """
         Evaluates a pyfunc-compatible input and produces a pyfunc-compatible output.
         For more information about the pyfunc input/output API, see the :ref:`pyfunc-inference-api`.
@@ -93,7 +109,48 @@ class PythonModel:
         :param context: A :class:`~PythonModelContext` instance containing artifacts that the model
                         can use to perform inference.
         :param model_input: A pyfunc-compatible input for the model to evaluate.
+        :param params: Additional parameters to pass to the model for inference.
+
+                       .. Note:: Experimental: This parameter may change or be removed in a future
+                                               release without warning.
         """
+
+
+class _FunctionPythonModel(PythonModel):
+    """
+    When a user specifies a ``python_model`` argument that is a function, we wrap the function
+    in an instance of this class.
+    """
+
+    def __init__(self, func, hints=None, signature=None):
+        self.func = func
+        self.hints = hints
+        self.signature = signature
+
+    def _get_type_hints(self):
+        return _extract_type_hints(self.func, input_arg_index=0)
+
+    def predict(
+        self,
+        context,  # pylint: disable=unused-argument
+        model_input,
+        params: Optional[Dict[str, Any]] = None,
+    ):
+        """
+        :param context: A :class:`~PythonModelContext` instance containing artifacts that the model
+                        can use to perform inference.
+        :param model_input: A pyfunc-compatible input for the model to evaluate.
+        :param params: Additional parameters to pass to the model for inference.
+
+                       .. Note:: Experimental: This parameter may change or be removed in a future
+                                               release without warning.
+
+        :return: Model predictions.
+        """
+        if inspect.signature(self.func).parameters.get("params"):
+            return self.func(model_input, params=params)
+        _log_warning_if_params_not_in_predict_signature(_logger, params)
+        return self.func(model_input)
 
 
 class PythonModelContext:
@@ -124,6 +181,8 @@ class PythonModelContext:
 def _save_model_with_class_artifacts_params(
     path,
     python_model,
+    signature=None,
+    hints=None,
     artifacts=None,
     conda_env=None,
     code_paths=None,
@@ -136,11 +195,14 @@ def _save_model_with_class_artifacts_params(
     :param python_model: An instance of a subclass of :class:`~PythonModel`. ``python_model``
                         defines how the model loads artifacts and how it performs inference.
     :param artifacts: A dictionary containing ``<name, artifact_uri>`` entries.
-                      Remote artifact URIs
-                      are resolved to absolute filesystem paths, producing a dictionary of
-                      ``<name, absolute_path>`` entries. ``python_model`` can reference these
-                      resolved entries as the ``artifacts`` property of the ``context``
-                      attribute. If ``None``, no artifacts are added to the model.
+                      Remote artifact URIs are resolved to absolute filesystem paths, producing
+                      a dictionary of ``<name, absolute_path>`` entries,
+                      (e.g. {"file": "aboslute_path"}). ``python_model`` can reference these
+                      resolved entries as the ``artifacts`` property of the ``context`` attribute.
+                      If ``<artifact_name, 'hf:/repo_id'>``(e.g. {"bert-tiny-model":
+                      "hf:/prajjwal1/bert-tiny"}) is provided, then the model can be fetched from
+                      huggingface hub using repo_id `prajjwal1/bert-tiny` directly.
+                      If ``None``, no artifacts are added to the model.
     :param conda_env: Either a dictionary representation of a Conda environment or the
                       path to a Conda environment yaml file. If provided, this decsribes the
                       environment this model should be run in. At minimum, it should specify
@@ -158,34 +220,60 @@ def _save_model_with_class_artifacts_params(
     custom_model_config_kwargs = {
         CONFIG_KEY_CLOUDPICKLE_VERSION: cloudpickle.__version__,
     }
-    if isinstance(python_model, PythonModel):
-        saved_python_model_subpath = "python_model.pkl"
-        with open(os.path.join(path, saved_python_model_subpath), "wb") as out:
-            cloudpickle.dump(python_model, out)
-        custom_model_config_kwargs[CONFIG_KEY_PYTHON_MODEL] = saved_python_model_subpath
-    else:
-        raise MlflowException(
-            message=(
-                "`python_model` must be a subclass of `PythonModel`. Instead, found an"
-                " object of type: {python_model_type}".format(python_model_type=type(python_model))
-            ),
-            error_code=INVALID_PARAMETER_VALUE,
-        )
+    if callable(python_model):
+        python_model = _FunctionPythonModel(python_model, hints, signature)
+    saved_python_model_subpath = "python_model.pkl"
+    with open(os.path.join(path, saved_python_model_subpath), "wb") as out:
+        cloudpickle.dump(python_model, out)
+    custom_model_config_kwargs[CONFIG_KEY_PYTHON_MODEL] = saved_python_model_subpath
 
     if artifacts:
         saved_artifacts_config = {}
         with TempDir() as tmp_artifacts_dir:
-            tmp_artifacts_config = {}
             saved_artifacts_dir_subpath = "artifacts"
+            hf_prefix = "hf:/"
             for artifact_name, artifact_uri in artifacts.items():
-                tmp_artifact_path = _download_artifact_from_uri(
-                    artifact_uri=artifact_uri, output_path=tmp_artifacts_dir.path()
-                )
-                tmp_artifacts_config[artifact_name] = tmp_artifact_path
-                saved_artifact_subpath = posixpath.join(
-                    saved_artifacts_dir_subpath,
-                    os.path.relpath(path=tmp_artifact_path, start=tmp_artifacts_dir.path()),
-                )
+                if artifact_uri.startswith(hf_prefix):
+                    try:
+                        from huggingface_hub import snapshot_download
+                    except ImportError as e:
+                        raise MlflowException(
+                            "Failed to import huggingface_hub. Please install huggingface_hub "
+                            f"to log the model with artifact_uri {artifact_uri}. Error: {e}"
+                        )
+
+                    repo_id = artifact_uri[len(hf_prefix) :]
+                    try:
+                        snapshot_location = snapshot_download(
+                            repo_id=repo_id,
+                            local_dir=os.path.join(
+                                path, saved_artifacts_dir_subpath, artifact_name
+                            ),
+                            local_dir_use_symlinks=False,
+                        )
+                    except Exception as e:
+                        raise MlflowException.invalid_parameter_value(
+                            "Failed to download snapshot from Hugging Face Hub with artifact_uri: "
+                            f"{artifact_uri}. Error: {e}"
+                        )
+                    saved_artifact_subpath = (
+                        Path(snapshot_location).relative_to(Path(os.path.realpath(path))).as_posix()
+                    )
+                else:
+                    tmp_artifact_path = _download_artifact_from_uri(
+                        artifact_uri=artifact_uri, output_path=tmp_artifacts_dir.path()
+                    )
+
+                    relative_path = (
+                        Path(tmp_artifact_path)
+                        .relative_to(Path(tmp_artifacts_dir.path()))
+                        .as_posix()
+                    )
+
+                    saved_artifact_subpath = os.path.join(
+                        saved_artifacts_dir_subpath, relative_path
+                    )
+
                 saved_artifacts_config[artifact_name] = {
                     CONFIG_KEY_ARTIFACT_RELATIVE_PATH: saved_artifact_subpath,
                     CONFIG_KEY_ARTIFACT_URI: artifact_uri,
@@ -283,7 +371,15 @@ def _load_pyfunc(model_path):
 
     context = PythonModelContext(artifacts=artifacts)
     python_model.load_context(context=context)
-    return _PythonModelPyfuncWrapper(python_model=python_model, context=context)
+    signature = mlflow.models.Model.load(model_path).signature
+    return _PythonModelPyfuncWrapper(
+        python_model=python_model, context=context, signature=signature
+    )
+
+
+def _get_first_string_column(pdf):
+    iter_string_columns = (col for col, val in pdf.iloc[0].items() if isinstance(val, str))
+    return next(iter_string_columns, None)
 
 
 class _PythonModelPyfuncWrapper:
@@ -292,14 +388,63 @@ class _PythonModelPyfuncWrapper:
     predict(model_input: pd.DataFrame) -> model's output as pd.DataFrame (pandas DataFrame)
     """
 
-    def __init__(self, python_model, context):
+    def __init__(self, python_model, context, signature):
         """
         :param python_model: An instance of a subclass of :class:`~PythonModel`.
         :param context: A :class:`~PythonModelContext` instance containing artifacts that
                         ``python_model`` may use when performing inference.
+        :param signature: :class:`~ModelSignature` instance describing model input and output.
         """
         self.python_model = python_model
         self.context = context
+        self.signature = signature
 
-    def predict(self, model_input):
-        return self.python_model.predict(self.context, model_input)
+    def _convert_input(self, model_input):
+        import pandas as pd
+
+        hints = self.python_model._get_type_hints()
+        if hints.input == List[str]:
+            if isinstance(model_input, pd.DataFrame):
+                first_string_column = _get_first_string_column(model_input)
+                if first_string_column is None:
+                    raise MlflowException.invalid_parameter_value(
+                        "Expected model input to contain at least one string column"
+                    )
+                return model_input[first_string_column].tolist()
+            elif isinstance(model_input, list):
+                if all(isinstance(x, dict) for x in model_input):
+                    return [next(iter(d.values())) for d in model_input]
+                elif all(isinstance(x, str) for x in model_input):
+                    return model_input
+        elif hints.input == List[Dict[str, str]]:
+            if isinstance(model_input, pd.DataFrame):
+                if (
+                    len(self.signature.inputs) == 1
+                    and next(iter(self.signature.inputs)).name is None
+                ):
+                    first_string_column = _get_first_string_column(model_input)
+                    return model_input[[first_string_column]].to_dict(orient="records")
+                columns = [x.name for x in self.signature.inputs]
+                return model_input[columns].to_dict(orient="records")
+            elif isinstance(model_input, list) and all(isinstance(x, dict) for x in model_input):
+                keys = [x.name for x in self.signature.inputs]
+                return [{k: d[k] for k in keys} for d in model_input]
+
+        return model_input
+
+    def predict(self, model_input, params: Optional[Dict[str, Any]] = None):
+        """
+        :param model_input: Model input data.
+        :param params: Additional parameters to pass to the model for inference.
+
+                       .. Note:: Experimental: This parameter may change or be removed in a future
+                                               release without warning.
+
+        :return: Model predictions.
+        """
+        if inspect.signature(self.python_model.predict).parameters.get("params"):
+            return self.python_model.predict(
+                self.context, self._convert_input(model_input), params=params
+            )
+        _log_warning_if_params_not_in_predict_signature(_logger, params)
+        return self.python_model.predict(self.context, self._convert_input(model_input))

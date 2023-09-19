@@ -1,16 +1,15 @@
-import numpy as np
+import logging
 import os
-import shutil
 import tempfile
 from functools import partial
+
 import matplotlib.pyplot as plt
-import logging
+import numpy as np
+from fastai.callback.core import Callback
 
 import mlflow.tracking
-from mlflow.utils.autologging_utils import ExceptionSafeClass, get_autologging_config
 from mlflow.fastai import log_model
-
-from fastai.callback.core import Callback
+from mlflow.utils.autologging_utils import ExceptionSafeClass, get_autologging_config
 
 _logger = logging.getLogger(__name__)
 
@@ -22,8 +21,8 @@ class __MlflowFastaiCallback(Callback, metaclass=ExceptionSafeClass):
     Records model structural information as params when training begins.
     """
 
-    from fastai.learner import Recorder
     from fastai.callback.all import TrackerCallback
+    from fastai.learner import Recorder
 
     remove_on_fetch, run_before, run_after = True, TrackerCallback, Recorder
 
@@ -103,14 +102,11 @@ class __MlflowFastaiCallback(Callback, metaclass=ExceptionSafeClass):
                     plt.plot(values)
                     plt.ylabel(param)
 
-                    tempdir = tempfile.mkdtemp()
-                    try:
+                    with tempfile.TemporaryDirectory() as tempdir:
                         scheds_file = os.path.join(tempdir, self.freeze_prefix + param + ".png")
                         plt.savefig(scheds_file)
                         plt.close(fig)
                         mlflow.log_artifact(local_path=scheds_file)
-                    finally:
-                        shutil.rmtree(tempdir)
                 break
 
         for param in self.opt.hypers[0]:

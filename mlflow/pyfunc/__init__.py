@@ -208,7 +208,9 @@ You may prefer the second, lower-level workflow for the following reasons:
 """
 
 import collections
+import functools
 import importlib
+import inspect
 import logging
 import os
 import signal
@@ -217,7 +219,7 @@ import sys
 import tempfile
 import threading
 from copy import deepcopy
-from typing import Any, Union, Iterator, Tuple
+from typing import Any, Dict, Iterator, Optional, Tuple, Union
 
 import numpy as np
 import pandas
@@ -225,56 +227,69 @@ import yaml
 
 import mlflow
 import mlflow.pyfunc.model
-from mlflow.environment_variables import MLFLOW_SCORING_SERVER_REQUEST_TIMEOUT
+from mlflow.environment_variables import (
+    _MLFLOW_TESTING,
+    MLFLOW_OPENAI_RETRIES_ENABLED,
+    MLFLOW_SCORING_SERVER_REQUEST_TIMEOUT,
+)
 from mlflow.exceptions import MlflowException
-from mlflow.models import Model, ModelSignature, ModelInputExample
+from mlflow.models import Model, ModelInputExample, ModelSignature
 from mlflow.models.flavor_backend_registry import get_flavor_backend
-from mlflow.models.model import MLMODEL_FILE_NAME
+from mlflow.models.model import _DATABRICKS_FS_LOADER_MODULE, MLMODEL_FILE_NAME
+from mlflow.models.signature import _infer_signature_from_type_hints
 from mlflow.models.utils import (
     PyFuncInput,
     PyFuncOutput,
+    _enforce_params_schema,
     _enforce_schema,
     _save_example,
 )
 from mlflow.protos.databricks_pb2 import (
+    BAD_REQUEST,
     INVALID_PARAMETER_VALUE,
     RESOURCE_DOES_NOT_EXIST,
 )
-from mlflow.pyfunc.model import (  # pylint: disable=unused-import
+from mlflow.pyfunc.model import (
     PythonModel,
-    PythonModelContext,
-    get_default_conda_env,
+    PythonModelContext,  # noqa: F401
+    _log_warning_if_params_not_in_predict_signature,
+    get_default_conda_env,  # noqa: F401
+    get_default_pip_requirements,
 )
-from mlflow.pyfunc.model import get_default_pip_requirements
 from mlflow.tracking._model_registry import DEFAULT_AWAIT_MAX_SLEEP_SECONDS
 from mlflow.tracking.artifact_utils import _download_artifact_from_uri
 from mlflow.utils import (
     PYTHON_VERSION,
-    get_major_minor_py_version,
     _is_in_ipython_notebook,
+    check_port_connectivity,
+    find_free_port,
+    get_major_minor_py_version,
 )
 from mlflow.utils import env_manager as _EnvManager
-from mlflow.utils import find_free_port, check_port_connectivity
 from mlflow.utils.annotations import deprecated, experimental
 from mlflow.utils.databricks_utils import is_in_databricks_runtime
-from mlflow.utils.docstring_utils import format_docstring, LOG_MODEL_PARAM_DOCS
+from mlflow.utils.docstring_utils import LOG_MODEL_PARAM_DOCS, format_docstring
 from mlflow.utils.environment import (
-    _validate_env_arguments,
-    _process_pip_requirements,
-    _process_conda_env,
     _CONDA_ENV_FILE_NAME,
-    _REQUIREMENTS_FILE_NAME,
     _CONSTRAINTS_FILE_NAME,
     _PYTHON_ENV_FILE_NAME,
+    _REQUIREMENTS_FILE_NAME,
+    _process_conda_env,
+    _process_pip_requirements,
     _PythonEnv,
+    _validate_env_arguments,
 )
-from mlflow.utils.file_utils import _copy_file_or_tree, write_to
-from mlflow.utils.file_utils import get_or_create_tmp_dir, get_or_create_nfs_tmp_dir
+from mlflow.utils.file_utils import (
+    _copy_file_or_tree,
+    get_or_create_nfs_tmp_dir,
+    get_or_create_tmp_dir,
+    write_to,
+)
 from mlflow.utils.model_utils import (
-    _get_flavor_configuration,
-    _validate_and_copy_code_paths,
     _add_code_from_conf_to_system_path,
+    _get_flavor_configuration,
     _get_flavor_configuration_from_ml_model_file,
+    _validate_and_copy_code_paths,
     _validate_and_prepare_target_save_path,
 )
 from mlflow.utils.nfs_on_spark import get_nfs_cache_root_dir
@@ -360,6 +375,19 @@ def _load_model_env(path):
     return _get_flavor_configuration(model_path=path, flavor_name=FLAVOR_NAME).get(ENV, None)
 
 
+def _validate_params(params, model_metadata):
+    if hasattr(model_metadata, "get_params_schema"):
+        params_schema = model_metadata.get_params_schema()
+        return _enforce_params_schema(params, params_schema)
+    if params:
+        raise MlflowException.invalid_parameter_value(
+            "This model was not logged with a params schema and does not support "
+            "providing the params argument."
+            "Please log the model with mlflow >= 2.6.0 and specify a params schema.",
+        )
+    return
+
+
 class PyFuncModel:
     """
     MLflow 'python function' model.
@@ -384,7 +412,7 @@ class PyFuncModel:
         self._model_impl = model_impl
         self._predict_fn = getattr(model_impl, predict_fn)
 
-    def predict(self, data: PyFuncInput) -> PyFuncOutput:
+    def predict(self, data: PyFuncInput, params: Optional[Dict[str, Any]] = None) -> PyFuncOutput:
         """
         Generate model predictions.
 
@@ -405,12 +433,39 @@ class PyFuncModel:
                      (i.e. read / write the elements using C-like index order), and DataFrame
                      column values will be cast as the required tensor spec type.
 
+        :param params: Additional parameters to pass to the model for inference.
+
+                       .. Note:: Experimental: This parameter may change or be removed in a future
+                                               release without warning.
+
         :return: Model predictions as one of pandas.DataFrame, pandas.Series, numpy.ndarray or list.
         """
         input_schema = self.metadata.get_input_schema()
         if input_schema is not None:
             data = _enforce_schema(data, input_schema)
-        return self._predict_fn(data)
+
+        params = _validate_params(params, self.metadata)
+
+        def _predict():
+            # Models saved prior to MLflow 2.5.0 do not support `params` in the pyfunc `predict()`
+            # function definition, nor do they support `**kwargs`. Accordingly, we only pass
+            # `params` to the `predict()` method if it defines the `params` argument
+            if inspect.signature(self._predict_fn).parameters.get("params"):
+                return self._predict_fn(data, params=params)
+            _log_warning_if_params_not_in_predict_signature(_logger, params)
+            return self._predict_fn(data)
+
+        if "openai" in sys.modules and MLFLOW_OPENAI_RETRIES_ENABLED.get():
+            from mlflow.openai.retry import openai_auto_retry_patch
+
+            try:
+                with openai_auto_retry_patch():
+                    return _predict()
+            except Exception:
+                if _MLFLOW_TESTING.get():
+                    raise
+
+        return _predict()
 
     @experimental
     def unwrap_python_model(self):
@@ -422,7 +477,7 @@ class PyFuncModel:
 
         :return: The underlying wrapped model object
 
-        .. test-code-block:: python
+        .. testcode:: python
             :caption: Example
 
             import mlflow
@@ -430,19 +485,18 @@ class PyFuncModel:
 
             # define a custom model
             class MyModel(mlflow.pyfunc.PythonModel):
-                def predict(self, context, model_input):
-                    return self.my_custom_function(model_input)
+                def predict(self, context, model_input, params=None):
+                    return self.my_custom_function(model_input, params)
 
-                def my_custom_function(self, model_input):
+                def my_custom_function(self, model_input, params=None):
                     # do something with the model input
                     return 0
 
 
             some_input = 1
             # save the model
-            my_model = MyModel()
             with mlflow.start_run():
-                model_info = mlflow.pyfunc.log_model(artifact_path="model", python_model=my_model)
+                model_info = mlflow.pyfunc.log_model(artifact_path="model", python_model=MyModel())
 
             # load the model
             loaded_model = mlflow.pyfunc.load_model(model_uri=model_info.model_uri)
@@ -526,7 +580,7 @@ def _warn_dependency_requirement_mismatches(model_path):
 
     except Exception as e:
         _logger.warning(
-            f"Encountered an unexpected error ({repr(e)}) while detecting model dependency "
+            f"Encountered an unexpected error ({e!r}) while detecting model dependency "
             "mismatches. Set logging level to DEBUG to see the full traceback."
         )
         _logger.debug("", exc_info=True)
@@ -579,7 +633,17 @@ def load_model(
 
     _add_code_from_conf_to_system_path(local_path, conf, code_key=CODE)
     data_path = os.path.join(local_path, conf[DATA]) if (DATA in conf) else local_path
-    model_impl = importlib.import_module(conf[MAIN])._load_pyfunc(data_path)
+    try:
+        model_impl = importlib.import_module(conf[MAIN])._load_pyfunc(data_path)
+    except ModuleNotFoundError as e:
+        if conf[MAIN] == _DATABRICKS_FS_LOADER_MODULE:
+            raise MlflowException(
+                "mlflow.pyfunc.load_model is not supported for Feature Store models. "
+                "spark_udf() and predict() will not work as expected. Use "
+                "score_batch for offline predictions.",
+                BAD_REQUEST,
+            ) from None
+        raise e
     predict_fn = conf.get("predict_fn", "predict")
     return PyFuncModel(model_meta=model_meta, model_impl=model_impl, predict_fn=predict_fn)
 
@@ -590,8 +654,21 @@ class _ServedPyFuncModel(PyFuncModel):
         self._client = client
         self._server_pid = server_pid
 
-    def predict(self, data):
-        result = self._client.invoke(data).get_predictions()
+    def predict(self, data, params=None):
+        """
+        :param data: Model input data.
+        :param params: Additional parameters to pass to the model for inference.
+
+                       .. Note:: Experimental: This parameter may change or be removed in a future
+                                               release without warning.
+
+        :return: Model predictions.
+        """
+        if inspect.signature(self._client.invoke).parameters.get("params"):
+            result = self._client.invoke(data, params=params).get_predictions()
+        else:
+            _log_warning_if_params_not_in_predict_signature(_logger, params)
+            result = self._client.invoke(data).get_predictions()
         if isinstance(result, pandas.DataFrame):
             result = result[result.columns[0]]
         return result
@@ -813,7 +890,166 @@ def _create_model_downloading_tmp_dir(should_use_nfs):
 _MLFLOW_SERVER_OUTPUT_TAIL_LINES_TO_KEEP = 200
 
 
-def spark_udf(spark, model_uri, result_type="double", env_manager=_EnvManager.LOCAL):
+def _cast_output_spec_to_spark_type(spec):
+    from pyspark.sql.types import ArrayType
+
+    from mlflow.types.schema import ColSpec, DataType, TensorSpec
+
+    # TODO: handle optional output columns.
+    if isinstance(spec, ColSpec):
+        return spec.type.to_spark()
+    elif isinstance(spec, TensorSpec):
+        data_type = DataType.from_numpy_type(spec.type)
+        if data_type is None:
+            raise MlflowException(
+                f"Model output tensor spec type {spec.type} is not supported in spark_udf.",
+                error_code=INVALID_PARAMETER_VALUE,
+            )
+
+        if len(spec.shape) == 1:
+            return ArrayType(data_type.to_spark())
+        elif len(spec.shape) == 2:
+            return ArrayType(ArrayType(data_type.to_spark()))
+        else:
+            raise MlflowException(
+                "Only 1D or 2D tensors are supported as spark_udf "
+                f"return value, but model output '{spec.name}' has shape {spec.shape}.",
+                error_code=INVALID_PARAMETER_VALUE,
+            )
+    else:
+        raise MlflowException(
+            f"Unknown schema output spec {spec}.", error_code=INVALID_PARAMETER_VALUE
+        )
+
+
+def _infer_spark_udf_return_type(model_output_schema):
+    from pyspark.sql.types import StructField, StructType
+
+    if len(model_output_schema.inputs) == 1:
+        return _cast_output_spec_to_spark_type(model_output_schema.inputs[0])
+
+    return StructType(
+        [
+            StructField(name=spec.name or str(i), dataType=_cast_output_spec_to_spark_type(spec))
+            for i, spec in enumerate(model_output_schema.inputs)
+        ]
+    )
+
+
+def _parse_spark_datatype(datatype: str):
+    from pyspark.sql.functions import udf
+
+    return_type = "boolean" if datatype == "bool" else datatype
+    return udf(lambda x: x, returnType=return_type).returnType
+
+
+def _is_none_or_nan(value):
+    # The condition `isinstance(value, float)` is needed to avoid error
+    # from `np.isnan(value)` if value is a non-numeric type.
+    return value is None or isinstance(value, float) and np.isnan(value)
+
+
+def _convert_array_values(values, elem_type, array_dim, spark_primitive_type_to_np_type):
+    """
+    Convert list or numpy array values to spark dataframe column values.
+    """
+    np_type = spark_primitive_type_to_np_type.get(type(elem_type))
+    if np_type is None:
+        raise MlflowException(
+            "Unsupported array type field with element type "
+            f"{elem_type.simpleString()} in struct type.",
+            error_code=INVALID_PARAMETER_VALUE,
+        )
+
+    # For array type result values, if provided value is None or NaN, regard it as a null array.
+    # see https://github.com/mlflow/mlflow/issues/8986
+    if array_dim == 1:
+        return [None if _is_none_or_nan(v) else np.array(v, dtype=np_type) for v in values]
+    else:
+        return [None if _is_none_or_nan(v) else list(np.array(v, dtype=np_type)) for v in values]
+
+
+def _get_spark_primitive_types():
+    from pyspark.sql import types
+
+    return (
+        types.IntegerType,
+        types.LongType,
+        types.FloatType,
+        types.DoubleType,
+        types.StringType,
+        types.BooleanType,
+    )
+
+
+def _check_udf_return_struct_type(struct_type):
+    from pyspark.sql.types import ArrayType
+
+    primitive_types = _get_spark_primitive_types()
+
+    for field in struct_type.fields:
+        field_type = field.dataType
+        if isinstance(field_type, primitive_types):
+            continue
+
+        if isinstance(field_type, ArrayType) and _check_udf_return_array_type(
+            field_type, allow_struct=False
+        ):
+            continue
+
+        return False
+
+    return True
+
+
+def _check_udf_return_array_type(array_type, allow_struct):
+    from pyspark.sql.types import ArrayType, StructType
+
+    elem_type = array_type.elementType
+    primitive_types = _get_spark_primitive_types()
+
+    if (
+        # 1D array of primitives
+        isinstance(elem_type, primitive_types)
+        or
+        # 2D array of primitives
+        (isinstance(elem_type, ArrayType) and isinstance(elem_type.elementType, primitive_types))
+    ):
+        return True
+
+    if isinstance(elem_type, StructType):
+        if allow_struct:
+            # Array of struct values.
+            return _check_udf_return_struct_type(elem_type)
+
+        return False
+
+    return False
+
+
+def _check_udf_return_type(data_type):
+    from pyspark.sql.types import ArrayType, StructType
+
+    primitive_types = _get_spark_primitive_types()
+    if isinstance(data_type, primitive_types):
+        return True
+
+    if isinstance(data_type, ArrayType):
+        return _check_udf_return_array_type(data_type, allow_struct=True)
+
+    if isinstance(data_type, StructType):
+        return _check_udf_return_struct_type(data_type)
+
+    return False
+
+
+def spark_udf(
+    spark,
+    model_uri,
+    result_type=None,
+    env_manager=_EnvManager.LOCAL,
+    params: Optional[Dict[str, Any]] = None,
+):
     """
     A Spark UDF that can be used to invoke the Python function formatted model.
 
@@ -869,6 +1105,10 @@ def spark_udf(spark, model_uri, result_type="double", env_manager=_EnvManager.LO
         ``pyspark.sql.types.DataType`` object or a DDL-formatted type string. Only a primitive
         type, an array ``pyspark.sql.types.ArrayType`` of primitive type, or a struct type
         containing fields of above 2 kinds of types are allowed.
+        If unspecified, it tries to infer result type from model signature
+        output schema, if model output schema is not available, it fallbacks to use ``double``
+        type.
+
         The following classes of result type are supported:
 
         - "int" or ``pyspark.sql.types.IntegerType``: The leftmost integer that can fit in an
@@ -913,33 +1153,36 @@ def spark_udf(spark, model_uri, result_type="double", env_manager=_EnvManager.LO
                            may differ from the environment used to train the model and may lead to
                            errors or invalid predictions.
 
+    :param params: Additional parameters to pass to the model for inference.
+
+                   .. Note:: Experimental: This parameter may change or be removed in a future
+                                           release without warning.
+
     :return: Spark UDF that applies the model's ``predict`` method to the data and returns a
              type specified by ``result_type``, which by default is a double.
     """
 
     # Scope Spark import to this method so users don't need pyspark to use non-Spark-related
     # functionality.
-    import functools
-    from mlflow.pyfunc.spark_model_cache import SparkModelCache
-    from mlflow.utils._spark_utils import _SparkDirectoryDistributor
     from pyspark.sql.functions import pandas_udf
-    from pyspark.sql.types import _parse_datatype_string
     from pyspark.sql.types import (
         ArrayType,
-        DataType as SparkDataType,
-        StructType as SparkStructType,
-    )
-    from pyspark.sql.types import (
+        BooleanType,
         DoubleType,
-        IntegerType,
         FloatType,
+        IntegerType,
         LongType,
         StringType,
-        BooleanType,
     )
+    from pyspark.sql.types import StructType as SparkStructType
+
+    from mlflow.pyfunc.spark_model_cache import SparkModelCache
+    from mlflow.utils._spark_utils import _SparkDirectoryDistributor
 
     # Used in test to force install local version of mlflow when starting a model server
     mlflow_home = os.environ.get("MLFLOW_HOME")
+    openai_env_vars = mlflow.openai._OpenAIEnvVar.read_environ()
+    mlflow_testing = _MLFLOW_TESTING.get_raw()
 
     _EnvManager.validate(env_manager)
 
@@ -950,32 +1193,6 @@ def spark_udf(spark, model_uri, result_type="double", env_manager=_EnvManager.LO
     nfs_root_dir = get_nfs_cache_root_dir()
     should_use_nfs = nfs_root_dir is not None
     should_use_spark_to_broadcast_file = not (is_spark_in_local_mode or should_use_nfs)
-
-    result_type = "boolean" if result_type == "bool" else result_type
-
-    if not isinstance(result_type, SparkDataType):
-        result_type = _parse_datatype_string(result_type)
-
-    elem_type = result_type
-    if isinstance(elem_type, ArrayType):
-        elem_type = elem_type.elementType
-
-    supported_types = [
-        IntegerType,
-        LongType,
-        FloatType,
-        DoubleType,
-        StringType,
-        BooleanType,
-        SparkStructType,
-    ]
-
-    if not any(isinstance(elem_type, x) for x in supported_types):
-        raise MlflowException(
-            message="Invalid result_type '{}'. Result type can only be one of or an array of one "
-            "of the following types: {}".format(str(elem_type), str(supported_types)),
-            error_code=INVALID_PARAMETER_VALUE,
-        )
 
     local_model_path = _download_artifact_from_uri(
         artifact_uri=model_uri,
@@ -1033,6 +1250,40 @@ def spark_udf(spark, model_uri, result_type="double", env_manager=_EnvManager.LO
 
     model_metadata = Model.load(os.path.join(local_model_path, MLMODEL_FILE_NAME))
 
+    if result_type is None:
+        if model_output_schema := model_metadata.get_output_schema():
+            result_type = _infer_spark_udf_return_type(model_output_schema)
+        else:
+            _logger.warning(
+                "No 'result_type' provided for spark_udf and the model does not "
+                "have an output schema. 'result_type' is set to 'double' type."
+            )
+            result_type = DoubleType()
+    else:
+        if isinstance(result_type, str):
+            result_type = _parse_spark_datatype(result_type)
+
+    if not _check_udf_return_type(result_type):
+        raise MlflowException.invalid_parameter_value(
+            f"""Invalid 'spark_udf' result type: {result_type}.
+It must be one of the following types:
+Primitive types:
+ - int
+ - long
+ - float
+ - double
+ - string
+ - boolean
+Compound types:
+ - array<primitive>: An array of primitives, e.g., array<int>.
+ - array<array<primitive>>: A 2D array of primitives, e.g., array<array<int>>.
+ - struct<field: primitive | array<primitive> | array<array<primitive>>, ...>:
+   A struct with primitive, array<primitive>, or array<array<primitive>>,
+   e.g., struct<a:int, b:array<int>>.
+"""
+        )
+    params = _validate_params(params, model_metadata)
+
     def _predict_row_batch(predict_fn, args):
         input_schema = model_metadata.get_input_schema()
         pdf = None
@@ -1042,7 +1293,7 @@ def spark_udf(spark, model_uri, result_type="double", env_manager=_EnvManager.LO
                 if len(args) != 1:
                     raise Exception(
                         "If passing a StructType column, there should be only one "
-                        "input column, but got %d" % len(args)
+                        f"input column, but got {len(args)}."
                     )
                 pdf = x
         if pdf is None:
@@ -1051,24 +1302,22 @@ def spark_udf(spark, model_uri, result_type="double", env_manager=_EnvManager.LO
                 names = [str(i) for i in range(len(args))]
             else:
                 names = input_schema.input_names()
+                required_names = input_schema.required_input_names()
                 if len(args) > len(names):
                     args = args[: len(names)]
-                if len(args) < len(names):
+                if len(args) < len(required_names):
                     raise MlflowException(
-                        "Model input is missing columns. Expected {} input columns {},"
-                        " but the model received only {} unnamed input columns"
+                        "Model input is missing required columns. Expected {} required"
+                        " input columns {}, but the model received only {} unnamed input columns"
                         " (Since the columns were passed unnamed they are expected to be in"
                         " the order specified by the schema).".format(len(names), names, len(args))
                     )
             pdf = pandas.DataFrame(data={names[i]: x for i, x in enumerate(args)}, columns=names)
 
-        result = predict_fn(pdf)
+        result = predict_fn(pdf, params)
 
         if isinstance(result, dict):
             result = {k: list(v) for k, v in result.items()}
-
-        if not isinstance(result, pandas.DataFrame):
-            result = pandas.DataFrame(data=result)
 
         spark_primitive_type_to_np_type = {
             IntegerType: np.int32,
@@ -1078,6 +1327,15 @@ def spark_udf(spark, model_uri, result_type="double", env_manager=_EnvManager.LO
             BooleanType: np.bool_,
             StringType: np.str_,
         }
+
+        if isinstance(result_type, ArrayType) and isinstance(result_type.elementType, ArrayType):
+            result_values = _convert_array_values(
+                result, result_type.elementType.elementType, 2, spark_primitive_type_to_np_type
+            )
+            return pandas.Series(result_values)
+
+        if not isinstance(result, pandas.DataFrame):
+            result = pandas.DataFrame(data=result)
 
         if isinstance(result_type, SparkStructType):
             result_dict = {}
@@ -1089,26 +1347,22 @@ def spark_udf(spark, model_uri, result_type="double", env_manager=_EnvManager.LO
                     np_type = spark_primitive_type_to_np_type[type(field_type)]
                     field_values = field_values.astype(np_type)
 
-                elif type(field_type) == ArrayType:
-                    elem_type = field_type.elementType
-                    if type(elem_type) not in spark_primitive_type_to_np_type:
-                        raise MlflowException(
-                            "Unsupported array type field with element type "
-                            f"{elem_type.simpleString()} in struct type.",
-                            error_code=INVALID_PARAMETER_VALUE,
-                        )
-                    np_type = spark_primitive_type_to_np_type[type(elem_type)]
+                elif isinstance(field_type, ArrayType):
+                    if isinstance(field_type.elementType, ArrayType):
+                        array_dim = 2
+                        elem_type = field_type.elementType.elementType
+                    else:
+                        array_dim = 1
+                        elem_type = field_type.elementType
 
-                    field_values = [
-                        np.array(v, dtype=np.dtype(type(elem_type))) for v in field_values
-                    ]
-
+                    field_values = _convert_array_values(
+                        field_values, elem_type, array_dim, spark_primitive_type_to_np_type
+                    )
                 else:
                     raise MlflowException(
                         f"Unsupported field type {field_type.simpleString()} in struct type.",
                         error_code=INVALID_PARAMETER_VALUE,
                     )
-
                 result_dict[field_name] = field_values
 
             return pandas.DataFrame(result_dict)
@@ -1137,8 +1391,8 @@ def spark_udf(spark, model_uri, result_type="double", env_manager=_EnvManager.LO
         if len(result.columns) == 0:
             raise MlflowException(
                 message="The model did not produce any values compatible with the requested "
-                "type '{}'. Consider requesting udf with StringType or "
-                "Arraytype(StringType).".format(str(elem_type)),
+                f"type '{elem_type}'. Consider requesting udf with StringType or "
+                "Arraytype(StringType).",
                 error_code=INVALID_PARAMETER_VALUE,
             )
 
@@ -1168,6 +1422,10 @@ def spark_udf(spark, model_uri, result_type="double", env_manager=_EnvManager.LO
         # tuple of pandas.Series and outputs an iterator of pandas.Series.
         if mlflow_home is not None:
             os.environ["MLFLOW_HOME"] = mlflow_home
+        if openai_env_vars:
+            os.environ.update(openai_env_vars)
+        if mlflow_testing:
+            _MLFLOW_TESTING.set(mlflow_testing)
         scoring_server_proc = None
 
         if env_manager != _EnvManager.LOCAL:
@@ -1226,8 +1484,8 @@ def spark_udf(spark, model_uri, result_type="double", env_manager=_EnvManager.LO
             server_redirect_log_thread = threading.Thread(
                 target=server_redirect_log_thread_func,
                 args=(scoring_server_proc.stdout,),
+                daemon=True,
             )
-            server_redirect_log_thread.setDaemon(True)
             server_redirect_log_thread.start()
 
             try:
@@ -1244,7 +1502,10 @@ def spark_udf(spark, model_uri, result_type="double", env_manager=_EnvManager.LO
                 err_msg += "".join(server_tail_logs)
                 raise MlflowException(err_msg) from e
 
-            def batch_predict_fn(pdf):
+            def batch_predict_fn(pdf, params=None):
+                if inspect.signature(client.invoke).parameters.get("params"):
+                    return client.invoke(pdf, params=params).get_predictions()
+                _log_warning_if_params_not_in_predict_signature(_logger, params)
                 return client.invoke(pdf).get_predictions()
 
         elif env_manager == _EnvManager.LOCAL:
@@ -1253,7 +1514,10 @@ def spark_udf(spark, model_uri, result_type="double", env_manager=_EnvManager.LO
             else:
                 loaded_model = mlflow.pyfunc.load_model(local_model_path)
 
-            def batch_predict_fn(pdf):
+            def batch_predict_fn(pdf, params=None):
+                if inspect.signature(loaded_model.predict).parameters.get("params"):
+                    return loaded_model.predict(pdf, params=params)
+                _log_warning_if_params_not_in_predict_signature(_logger, params)
                 return loaded_model.predict(pdf)
 
         try:
@@ -1281,7 +1545,12 @@ def spark_udf(spark, model_uri, result_type="double", env_manager=_EnvManager.LO
     def udf_with_default_cols(*args):
         if len(args) == 0:
             input_schema = model_metadata.get_input_schema()
-
+            if input_schema and len(input_schema.optional_input_names()) > 0:
+                raise MlflowException(
+                    message="Cannot apply UDF without column names specified when"
+                    " model signature contains optional columns.",
+                    error_code=INVALID_PARAMETER_VALUE,
+                )
             if input_schema and len(input_schema.inputs) > 0:
                 if input_schema.has_input_names():
                     input_names = input_schema.input_names()
@@ -1306,6 +1575,23 @@ def spark_udf(spark, model_uri, result_type="double", env_manager=_EnvManager.LO
             return udf(*args)
 
     return udf_with_default_cols
+
+
+def _validate_function_python_model(python_model):
+    if not (isinstance(python_model, PythonModel) or callable(python_model)):
+        raise MlflowException(
+            "`python_model` must be a PythonModel instance or a callable object",
+            error_code=INVALID_PARAMETER_VALUE,
+        )
+
+    if callable(python_model):
+        num_args = len(inspect.signature(python_model).parameters)
+        if num_args != 1:
+            raise MlflowException(
+                "When `python_model` is a callable object, it must accept exactly one argument. "
+                f"Found {num_args} arguments.",
+                error_code=INVALID_PARAMETER_VALUE,
+            )
 
 
 @format_docstring(LOG_MODEL_PARAM_DOCS.format(package_name="scikit-learn"))
@@ -1357,18 +1643,67 @@ def save_model(
     :param conda_env: {{ conda_env }}
     :param mlflow_model: :py:mod:`mlflow.models.Model` configuration to which to add the
                          **python_function** flavor.
-    :param python_model: An instance of a subclass of :class:`~PythonModel`. This class is
-                         serialized using the CloudPickle library. Any dependencies of the class
-                         should be included in one of the following locations:
+    :param python_model:
+        An instance of a subclass of :class:`~PythonModel` or a callable object with a single
+        argument (see the examples below). The passed-in object is serialized using the CloudPickle
+        library. Any dependencies of the class should be included in one of the following locations:
 
-                            - The MLflow library.
-                            - Package(s) listed in the model's Conda environment, specified by
-                              the ``conda_env`` parameter.
-                            - One or more of the files specified by the ``code_path`` parameter.
+        - The MLflow library.
+        - Package(s) listed in the model's Conda environment, specified by the ``conda_env``
+          parameter.
+        - One or more of the files specified by the ``code_path`` parameter.
 
-                         Note: If the class is imported from another module, as opposed to being
-                         defined in the ``__main__`` scope, the defining module should also be
-                         included in one of the listed locations.
+        Note: If the class is imported from another module, as opposed to being defined in the
+        ``__main__`` scope, the defining module should also be included in one of the listed
+        locations.
+
+        **Examples**
+
+        Class model
+
+        .. code-block:: python
+
+            from typing import List, Dict
+            import mlflow
+
+
+            class MyModel(mlflow.pyfunc.PythonModel):
+                def predict(self, context, model_input: List[str], params=None) -> List[str]:
+                    return [i.upper() for i in model_input]
+
+
+            mlflow.pyfunc.save_model("model", python_model=MyModel(), input_example=["a"])
+            model = mlflow.pyfunc.load_model("model")
+            print(model.predict(["a", "b", "c"]))  # -> ["A", "B", "C"]
+
+        Functional model
+
+        .. note::
+            Experimental: Functional model support is experimental and may change or be removed in
+            a future release without warning.
+
+        .. code-block:: python
+
+            from typing import List
+            import mlflow
+
+
+            def predict(model_input: List[str]) -> List[str]:
+                return [i.upper() for i in model_input]
+
+
+            mlflow.pyfunc.save_model("model", python_model=predict, input_example=["a"])
+            model = mlflow.pyfunc.load_model("model")
+            print(model.predict(["a", "b", "c"]))  # -> ["A", "B", "C"]
+
+        If the `predict` method or function has type annotations, MLflow automatically constructs
+        a model signature based on the type annotations (unless the ``signature`` argument is
+        explicitly specified), and converts the input value to the specified type before passing
+        it to the function. Currently, the following type annotations are supported:
+
+            - ``List[str]``
+            - ``List[Dict[str, str]]``
+
     :param artifacts: A dictionary containing ``<name, artifact_uri>`` entries. Remote artifact URIs
                       are resolved to absolute filesystem paths, producing a dictionary of
                       ``<name, absolute_path>`` entries. ``python_model`` can reference these
@@ -1396,7 +1731,7 @@ def save_model(
 
                       .. code-block:: python
 
-                        from mlflow.models.signature import infer_signature
+                        from mlflow.models import infer_signature
 
                         train = df.drop_column("target_label")
                         predictions = ...  # compute model predictions
@@ -1415,13 +1750,22 @@ def save_model(
                                              release without warning.
     """
     _validate_env_arguments(conda_env, pip_requirements, extra_pip_requirements)
+    if python_model:
+        _validate_function_python_model(python_model)
+        if callable(python_model) and all(
+            a is None for a in (input_example, pip_requirements, extra_pip_requirements)
+        ):
+            raise MlflowException(
+                "If `python_model` is a callable object, at least one of `input_example`, "
+                "`pip_requirements`, or `extra_pip_requirements` must be specified."
+            )
 
     mlflow_model = kwargs.pop("model", mlflow_model)
     if len(kwargs) > 0:
         raise TypeError(f"save_model() got unexpected keyword arguments: {kwargs}")
     if code_path is not None:
         if not isinstance(code_path, list):
-            raise TypeError("Argument code_path should be a list, not {}".format(type(code_path)))
+            raise TypeError(f"Argument code_path should be a list, not {type(code_path)}")
 
     first_argument_set = {
         "loader_module": loader_module,
@@ -1455,10 +1799,29 @@ def save_model(
         raise MlflowException(message=msg, error_code=INVALID_PARAMETER_VALUE)
 
     _validate_and_prepare_target_save_path(path)
+
     if mlflow_model is None:
         mlflow_model = Model()
+
+    hints = None
     if signature is not None:
         mlflow_model.signature = signature
+    elif python_model is not None:
+        if callable(python_model):
+            input_arg_index = 0  # first argument
+            if signature := _infer_signature_from_type_hints(
+                python_model, input_arg_index, input_example=input_example
+            ):
+                mlflow_model.signature = signature
+        elif isinstance(python_model, PythonModel):
+            input_arg_index = 1  # second argument
+            if signature := _infer_signature_from_type_hints(
+                python_model.predict,
+                input_arg_index=input_arg_index,
+                input_example=input_example,
+            ):
+                mlflow_model.signature = signature
+
     if input_example is not None:
         _save_example(mlflow_model, input_example, path)
     if metadata is not None:
@@ -1478,6 +1841,8 @@ def save_model(
     elif second_argument_set_specified:
         return mlflow.pyfunc.model._save_model_with_class_artifacts_params(
             path=path,
+            signature=signature,
+            hints=hints,
             python_model=python_model,
             artifacts=artifacts,
             conda_env=conda_env,
@@ -1531,18 +1896,75 @@ def log_model(
                       containing file dependencies). These files are *prepended* to the system
                       path before the model is loaded.
     :param conda_env: {{ conda_env }}
-    :param python_model: An instance of a subclass of :class:`~PythonModel`. This class is
-                         serialized using the CloudPickle library. Any dependencies of the class
-                         should be included in one of the following locations:
+    :param python_model:
+        An instance of a subclass of :class:`~PythonModel` or a callable object with a single
+        argument (see the examples below). The passed-in object is serialized using the CloudPickle
+        library. Any dependencies of the class should be included in one of the following locations:
 
-                            - The MLflow library.
-                            - Package(s) listed in the model's Conda environment, specified by
-                              the ``conda_env`` parameter.
-                            - One or more of the files specified by the ``code_path`` parameter.
+        - The MLflow library.
+        - Package(s) listed in the model's Conda environment, specified by the ``conda_env``
+          parameter.
+        - One or more of the files specified by the ``code_path`` parameter.
 
-                         Note: If the class is imported from another module, as opposed to being
-                         defined in the ``__main__`` scope, the defining module should also be
-                         included in one of the listed locations.
+        Note: If the class is imported from another module, as opposed to being defined in the
+        ``__main__`` scope, the defining module should also be included in one of the listed
+        locations.
+
+        **Examples**
+
+        Class model
+
+        .. code-block:: python
+
+            from typing import List
+            import mlflow
+
+
+            class MyModel(mlflow.pyfunc.PythonModel):
+                def predict(self, context, model_input: List[str], params=None) -> List[str]:
+                    return [i.upper() for i in model_input]
+
+
+            with mlflow.start_run():
+                model_info = mlflow.pyfunc.log_model(artifact_path="model", python_model=MyModel())
+
+
+            loaded_model = mlflow.pyfunc.load_model(model_uri=model_info.model_uri)
+            print(loaded_model.predict(["a", "b", "c"]))  # -> ["A", "B", "C"]
+
+        Functional model
+
+        .. note::
+            Experimental: Functional model support is experimental and may change or be removed in
+            a future release without warning.
+
+        .. code-block:: python
+
+            from typing import List
+            import mlflow
+
+
+            def predict(model_input: List[str]) -> List[str]:
+                return [i.upper() for i in model_input]
+
+
+            with mlflow.start_run():
+                model_info = mlflow.pyfunc.log_model(
+                    artifact_path="model", python_model=predict, input_example=["a"]
+                )
+
+
+            loaded_model = mlflow.pyfunc.load_model(model_uri=model_info.model_uri)
+            print(loaded_model.predict(["a", "b", "c"]))  # -> ["A", "B", "C"]
+
+        If the `predict` method or function has type annotations, MLflow automatically constructs
+        a model signature based on the type annotations (unless the ``signature`` argument is
+        explicitly specified), and converts the input value to the specified type before passing
+        it to the function. Currently, the following type annotations are supported:
+
+            - ``List[str]``
+            - ``List[Dict[str, str]]``
+
     :param artifacts: A dictionary containing ``<name, artifact_uri>`` entries. Remote artifact URIs
                       are resolved to absolute filesystem paths, producing a dictionary of
                       ``<name, absolute_path>`` entries. ``python_model`` can reference these
@@ -1574,7 +1996,7 @@ def log_model(
 
                       .. code-block:: python
 
-                        from mlflow.models.signature import infer_signature
+                        from mlflow.models import infer_signature
 
                         train = df.drop_column("target_label")
                         predictions = ...  # compute model predictions
@@ -1696,15 +2118,3 @@ def _save_model_with_loader_module_and_data_path(
 
     _PythonEnv.current().to_yaml(os.path.join(path, _PYTHON_ENV_FILE_NAME))
     return mlflow_model
-
-
-loader_template = """
-
-import importlib
-import os
-import sys
-
-def load_pyfunc():
-    {update_path}return importlib.import_module('{main}')._load_pyfunc('{data_path}')
-
-"""

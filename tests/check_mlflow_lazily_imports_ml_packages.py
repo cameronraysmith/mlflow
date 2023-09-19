@@ -2,16 +2,19 @@
 Tests that `import mlflow` and `mlflow.autolog()` do not import ML packages.
 """
 
-import sys
 import importlib
-import mlflow  # pylint: disable=unused-import
+import logging
+import sys
+
+import mlflow
+
+logger = logging.getLogger()
 
 
 def main():
     ml_packages = {
         "catboost",
         "fastai",
-        "mxnet",
         "h2o",
         "keras",
         "lightgbm",
@@ -29,6 +32,8 @@ def main():
         "xgboost",
         "pmdarima",
         "diviner",
+        "transformers",
+        "sentence_transformers",
     }
     imported = ml_packages.intersection(set(sys.modules))
     assert imported == set(), f"mlflow imports {imported} when it's imported but it should not"
@@ -43,6 +48,7 @@ def main():
         try:
             importlib.import_module(package)
         except ImportError:
+            logger.exception(f"Failed to import {package}")
             failed_to_import.append(package)
 
     message = (

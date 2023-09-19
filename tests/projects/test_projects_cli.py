@@ -1,22 +1,23 @@
-import json
 import hashlib
+import json
+import logging
 import os
 import shutil
-import logging
 from unittest import mock
 
-from click.testing import CliRunner
 import pytest
+from click.testing import CliRunner
 
-from mlflow import cli, MlflowClient
+from mlflow import MlflowClient, cli
 from mlflow.utils import process
+
 from tests.integration.utils import invoke_cli_runner
-from tests.projects.utils import docker_example_base_image  # pylint: disable=unused-import
 from tests.projects.utils import (
-    TEST_PROJECT_DIR,
     GIT_PROJECT_URI,
     SSH_PROJECT_URI,
     TEST_DOCKER_PROJECT_DIR,
+    TEST_PROJECT_DIR,
+    docker_example_base_image,  # noqa: F401
 )
 
 _logger = logging.getLogger(__name__)
@@ -39,9 +40,9 @@ def test_run_local_params(name):
             "-P",
             "greeting=hi",
             "-P",
-            "name=%s" % name,
+            f"name={name}",
             "-P",
-            "excitement=%s" % excitement_arg,
+            f"excitement={excitement_arg}",
         ],
     )
 
@@ -100,7 +101,7 @@ def test_run_local_conda_env():
         )
     invoke_cli_runner(
         cli.run,
-        [TEST_PROJECT_DIR, "-e", "check_conda_env", "-P", "conda_env_name=%s" % expected_env_name],
+        [TEST_PROJECT_DIR, "-e", "check_conda_env", "-P", f"conda_env_name={expected_env_name}"],
     )
 
 
@@ -142,13 +143,13 @@ def test_run_git_ssh_from_release_version():
 
 
 @pytest.mark.notrackingurimock
-def test_run_databricks_cluster_spec(tmpdir):
+def test_run_databricks_cluster_spec(tmp_path):
     cluster_spec = {
         "spark_version": "5.0.x-scala2.11",
         "num_workers": 2,
         "node_type_id": "i3.xlarge",
     }
-    cluster_spec_path = str(tmpdir.join("cluster-spec.json"))
+    cluster_spec_path = tmp_path.joinpath("cluster-spec.json")
     with open(cluster_spec_path, "w") as handle:
         json.dump(cluster_spec, handle)
 

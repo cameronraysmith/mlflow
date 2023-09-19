@@ -2,11 +2,11 @@ from unittest import mock
 
 import pytest
 
-from mlflow.exceptions import MlflowException
 from mlflow import server
+from mlflow.exceptions import MlflowException
 
 
-@pytest.fixture()
+@pytest.fixture
 def mock_exec_cmd():
     with mock.patch("mlflow.server._exec_cmd") as m:
         yield m
@@ -23,7 +23,19 @@ def test_find_app_non_existing_app():
 
 
 def test_build_waitress_command():
-    assert server._build_waitress_command("", "localhost", "5000", f"{server.__name__}:app") == [
+    assert server._build_waitress_command(
+        "", "localhost", "5000", f"{server.__name__}:app", is_factory=True
+    ) == [
+        "waitress-serve",
+        "--host=localhost",
+        "--port=5000",
+        "--ident=mlflow",
+        "--call",
+        "mlflow.server:app",
+    ]
+    assert server._build_waitress_command(
+        "", "localhost", "5000", f"{server.__name__}:app", is_factory=False
+    ) == [
         "waitress-serve",
         "--host=localhost",
         "--port=5000",

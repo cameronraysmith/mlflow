@@ -18,4 +18,29 @@ export class SearchExperimentRunsViewState {
    * Display "select columns" dropdown
    */
   columnSelectorVisible = false;
+
+  /**
+   * Display "select columns" dropdown
+   */
+  previewPaneVisible = false;
+
+  /**
+   * Determines if the experiment table is maximized
+   */
+  viewMaximized = false;
+
+  /**
+   * Persists controls state in the evaluation artifact compare mode
+   */
+  artifactViewState: {
+    selectedTables?: string[];
+    groupByCols?: string[];
+    outputColumn?: string;
+    intersectingOnly?: boolean;
+  } = {
+    selectedTables: [],
+    groupByCols: [],
+    outputColumn: '',
+    intersectingOnly: false,
+  };
 }

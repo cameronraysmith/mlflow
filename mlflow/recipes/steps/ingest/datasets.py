@@ -1,4 +1,3 @@
-from concurrent.futures import ThreadPoolExecutor, as_completed
 import importlib
 import logging
 import os
@@ -6,33 +5,33 @@ import pathlib
 import posixpath
 import sys
 from abc import abstractmethod
-from typing import Dict, Any, List, TypeVar, Optional, Union
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from typing import Any, Dict, List, Optional, Union
 from urllib.parse import urlparse
 
 from mlflow.artifacts import download_artifacts
 from mlflow.exceptions import MlflowException
-from mlflow.protos.databricks_pb2 import INVALID_PARAMETER_VALUE, BAD_REQUEST
+from mlflow.protos.databricks_pb2 import BAD_REQUEST, INVALID_PARAMETER_VALUE
 from mlflow.store.artifact.artifact_repo import (
     _NUM_DEFAULT_CPUS,
-    _NUM_MAX_THREADS_PER_CPU,
     _NUM_MAX_THREADS,
+    _NUM_MAX_THREADS_PER_CPU,
+)
+from mlflow.utils._spark_utils import (
+    _create_local_spark_session_for_recipes,
+    _get_active_spark_session,
 )
 from mlflow.utils.file_utils import (
     TempDir,
+    download_file_using_http_uri,
     get_local_path_or_none,
     local_file_uri_to_path,
-    write_pandas_df_as_parquet,
     read_parquet_as_pandas_df,
-    download_file_using_http_uri,
-)
-from mlflow.utils._spark_utils import (
-    _get_active_spark_session,
-    _create_local_spark_session_for_recipes,
+    write_pandas_df_as_parquet,
 )
 
 _logger = logging.getLogger(__name__)
 
-_DatasetType = TypeVar("_Dataset")
 
 _USER_DEFINED_INGEST_STEP_MODULE = "steps.ingest"
 
@@ -59,7 +58,7 @@ class _Dataset:
         pass
 
     @classmethod
-    def from_config(cls, dataset_config: Dict[str, Any], recipe_root: str) -> _DatasetType:
+    def from_config(cls, dataset_config: Dict[str, Any], recipe_root: str) -> "_Dataset":
         """
         Constructs a dataset instance from the specified dataset configuration
         and recipe root path.
@@ -79,7 +78,7 @@ class _Dataset:
 
     @classmethod
     @abstractmethod
-    def _from_config(cls, dataset_config, recipe_root) -> _DatasetType:
+    def _from_config(cls, dataset_config, recipe_root) -> "_Dataset":
         """
         Constructs a dataset instance from the specified dataset configuration
         and recipe root path.
@@ -164,7 +163,7 @@ class _LocationBasedDataset(_Dataset):
         pass
 
     @classmethod
-    def _from_config(cls, dataset_config: Dict[str, Any], recipe_root: str) -> _DatasetType:
+    def _from_config(cls, dataset_config: Dict[str, Any], recipe_root: str) -> "_Dataset":
         return cls(
             location=cls._get_required_config(dataset_config=dataset_config, key="location"),
             recipe_root=recipe_root,
@@ -498,7 +497,7 @@ class CustomDataset(_PandasConvertibleDataset):
             ) from e
 
     @classmethod
-    def _from_config(cls, dataset_config: Dict[str, Any], recipe_root: str) -> _DatasetType:
+    def _from_config(cls, dataset_config: Dict[str, Any], recipe_root: str) -> "_Dataset":
         return cls(
             location=cls._get_required_config(dataset_config=dataset_config, key="location"),
             dataset_format=cls._get_required_config(dataset_config=dataset_config, key="using"),
@@ -597,7 +596,7 @@ class DeltaTableDataset(_SparkDatasetMixin, _LocationBasedDataset):
         return dataset_format == "delta"
 
     @classmethod
-    def _from_config(cls, dataset_config: Dict[str, Any], recipe_root: str) -> _DatasetType:
+    def _from_config(cls, dataset_config: Dict[str, Any], recipe_root: str) -> "_Dataset":
         return cls(
             location=cls._get_required_config(dataset_config=dataset_config, key="location"),
             recipe_root=recipe_root,
@@ -641,7 +640,7 @@ class SparkSqlDataset(_SparkDatasetMixin, _Dataset):
         write_pandas_df_as_parquet(df=pandas_df, data_parquet_path=dst_path)
 
     @classmethod
-    def _from_config(cls, dataset_config: Dict[str, Any], recipe_root: str) -> _DatasetType:
+    def _from_config(cls, dataset_config: Dict[str, Any], recipe_root: str) -> "_Dataset":
         return cls(
             sql=dataset_config.get("sql"),
             location=dataset_config.get("location"),

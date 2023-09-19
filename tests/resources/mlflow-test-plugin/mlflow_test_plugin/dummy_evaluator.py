@@ -1,17 +1,21 @@
+import io
+import os
+import tempfile
+
+import pandas as pd
+from PIL import Image
+from sklearn import metrics as sk_metrics
+
 from mlflow import MlflowClient
+from mlflow.entities import Metric
 from mlflow.models.evaluation import (
-    ModelEvaluator,
     EvaluationArtifact,
     EvaluationResult,
+    ModelEvaluator,
 )
 from mlflow.models.evaluation.artifacts import ImageEvaluationArtifact
 from mlflow.tracking.artifact_utils import get_artifact_uri
-from mlflow.entities import Metric
-from mlflow.utils.time_utils import get_current_time_millis
-from sklearn import metrics as sk_metrics
-import pandas as pd
-import io
-from PIL import Image
+from mlflow.utils.time import get_current_time_millis
 
 
 class Array2DEvaluationArtifact(EvaluationArtifact):
@@ -81,12 +85,14 @@ class DummyEvaluator(ModelEvaluator):
                     ),
                     content=confusion_matrix_image,
                 )
-                confusion_matrix_image_artifact._save(confusion_matrix_image_artifact_name + ".png")
-                self.client.log_image(
-                    self.run_id,
-                    confusion_matrix_image,
-                    confusion_matrix_image_artifact_name + ".png",
-                )
+                with tempfile.TemporaryDirectory() as tmpdir:
+                    path = os.path.join(tmpdir, confusion_matrix_image_artifact_name + ".png")
+                    confusion_matrix_image_artifact._save(path)
+                    self.client.log_image(
+                        self.run_id,
+                        confusion_matrix_image,
+                        confusion_matrix_image_artifact_name + ".png",
+                    )
 
                 artifacts = {
                     confusion_matrix_artifact_name: confusion_matrix_artifact,

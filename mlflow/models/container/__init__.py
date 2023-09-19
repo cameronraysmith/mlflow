@@ -4,32 +4,28 @@ Initialize the environment and start model serving in a Docker container.
 To be executed only during the model deployment.
 
 """
+import logging
 import multiprocessing
 import os
-import signal
 import shutil
-from subprocess import check_call, Popen
+import signal
 import sys
-import logging
-
-from pkg_resources import resource_filename
+from pathlib import Path
+from subprocess import Popen, check_call
 
 import mlflow
 import mlflow.version
-
-from mlflow import pyfunc, mleap
+from mlflow import mleap, pyfunc
+from mlflow.environment_variables import MLFLOW_DEPLOYMENT_FLAVOR_NAME, MLFLOW_DISABLE_ENV_CREATION
 from mlflow.models import Model
 from mlflow.models.model import MLMODEL_FILE_NAME
-from mlflow.models.docker_utils import DISABLE_ENV_CREATION
-from mlflow.pyfunc import scoring_server, mlserver, _extract_conda_env
-from mlflow.version import VERSION as MLFLOW_VERSION
+from mlflow.pyfunc import _extract_conda_env, mlserver, scoring_server
 from mlflow.utils import env_manager as em
 from mlflow.utils.virtualenv import _get_or_create_virtualenv
+from mlflow.version import VERSION as MLFLOW_VERSION
 
 MODEL_PATH = "/opt/ml/model"
 
-
-DEPLOYMENT_CONFIG_KEY_FLAVOR_NAME = "MLFLOW_DEPLOYMENT_FLAVOR_NAME"
 
 DEFAULT_SAGEMAKER_SERVER_PORT = 8080
 DEFAULT_INFERENCE_SERVER_PORT = 8000
@@ -58,9 +54,7 @@ def _init(cmd, env_manager):
     elif cmd == "train":
         _train()
     else:
-        raise Exception(
-            "Unrecognized command {cmd}, full args = {args}".format(cmd=cmd, args=str(sys.argv))
-        )
+        raise Exception(f"Unrecognized command {cmd}, full args = {sys.argv}")
 
 
 def _serve(env_manager):
@@ -72,11 +66,8 @@ def _serve(env_manager):
     model_config_path = os.path.join(MODEL_PATH, MLMODEL_FILE_NAME)
     m = Model.load(model_config_path)
 
-    if DEPLOYMENT_CONFIG_KEY_FLAVOR_NAME in os.environ:
-        serving_flavor = os.environ[DEPLOYMENT_CONFIG_KEY_FLAVOR_NAME]
-    else:
-        # Older versions of mlflow may not specify a deployment configuration
-        serving_flavor = pyfunc.FLAVOR_NAME
+    # Older versions of mlflow may not specify a deployment configuration
+    serving_flavor = MLFLOW_DEPLOYMENT_FLAVOR_NAME.get() or pyfunc.FLAVOR_NAME
 
     if serving_flavor == mleap.FLAVOR_NAME:
         _serve_mleap()
@@ -126,9 +117,7 @@ def _install_pyfunc_deps(
     # dependency of mlflow on pip and we expect mlflow to be part of the environment.
     server_deps = ["gunicorn[gevent]"]
     if enable_mlserver:
-        # NOTE: Pin version until the next MLflow release (otherwise it won't
-        # pick up the requirements on the current's `setup.py`)
-        server_deps = ["'mlserver>=1.2.0.dev13'", "'mlserver-mlflow>=1.2.0.dev13'"]
+        server_deps = ["'mlserver>=1.2.0,!=1.3.1'", "'mlserver-mlflow>=1.2.0,!=1.3.1'"]
 
     install_server_deps = [f"pip install {' '.join(server_deps)}"]
     if Popen(["bash", "-c", " && ".join(activate_cmd + install_server_deps)]).wait() != 0:
@@ -149,7 +138,7 @@ def _serve_pyfunc(model, env_manager):
     # option to disable manually nginx. The default behavior is to enable nginx.
     disable_nginx = os.getenv(DISABLE_NGINX, "false").lower() == "true"
     enable_mlserver = os.getenv(ENABLE_MLSERVER, "false").lower() == "true"
-    disable_env_creation = os.environ.get(DISABLE_ENV_CREATION) == "true"
+    disable_env_creation = MLFLOW_DISABLE_ENV_CREATION.get()
 
     conf = model.flavors[pyfunc.FLAVOR_NAME]
     bash_cmds = []
@@ -172,8 +161,8 @@ def _serve_pyfunc(model, env_manager):
         start_nginx = False
 
     if start_nginx:
-        nginx_conf = resource_filename(
-            mlflow.models.__name__, "container/scoring_server/nginx.conf"
+        nginx_conf = Path(mlflow.models.__file__).parent.joinpath(
+            "container", "scoring_server", "nginx.conf"
         )
 
         nginx = Popen(["nginx", "-c", nginx_conf]) if start_nginx else None
@@ -187,12 +176,21 @@ def _serve_pyfunc(model, env_manager):
         procs.append(nginx)
 
     cpu_count = multiprocessing.cpu_count()
+    if enable_mlserver:
+        inference_server = mlserver
+        # Allows users to choose the number of workers using MLServer var env settings.
+        # Default to cpu count
+        nworkers = int(os.getenv("MLSERVER_INFER_WORKERS", cpu_count))
+        # Since MLServer will run without NGINX, expose the server in the `8080`
+        # port, which is the assumed "public" port.
+        port = DEFAULT_MLSERVER_PORT
+    else:
+        inference_server = scoring_server
+        # users can use GUNICORN_CMD_ARGS="--workers=3" var env to override the number of workers
+        nworkers = cpu_count
+        port = DEFAULT_INFERENCE_SERVER_PORT
 
-    inference_server = mlserver if enable_mlserver else scoring_server
-    # Since MLServer will run without NGINX, expose the server in the `8080`
-    # port, which is the assumed "public" port.
-    port = DEFAULT_MLSERVER_PORT if enable_mlserver else DEFAULT_INFERENCE_SERVER_PORT
-    cmd, cmd_env = inference_server.get_cmd(model_uri=MODEL_PATH, nworkers=cpu_count, port=port)
+    cmd, cmd_env = inference_server.get_cmd(model_uri=MODEL_PATH, nworkers=nworkers, port=port)
 
     bash_cmds.append(cmd)
     inference_server_process = Popen(["/bin/bash", "-c", " && ".join(bash_cmds)], env=cmd_env)

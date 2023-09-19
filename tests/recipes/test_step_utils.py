@@ -1,17 +1,18 @@
-import mlflow.recipes.utils.step as step_utils
+from unittest import mock
+
 import numpy as np
 import pytest
+from pandas import DataFrame
 
+import mlflow.recipes.utils.step as step_utils
 from mlflow.exceptions import MlflowException
 from mlflow.recipes.cards import pandas_renderer
 from mlflow.recipes.utils.step import (
     display_html,
     get_merged_eval_metrics,
-    truncate_pandas_data_profile,
     get_pandas_data_profiles,
+    truncate_pandas_data_profile,
 )
-from pandas import DataFrame
-from unittest import mock
 
 
 def test_display_html_raises_without_input():
@@ -29,12 +30,13 @@ def test_display_html_opens_html_data():
             patched_display.assert_called_once()
 
 
-def test_display_html_opens_html_file(tmp_path):
+def test_display_html_opens_html_file(tmp_path, monkeypatch):
     html_file = tmp_path / "test.html"
     html_file.write_text("<!DOCTYPE html><html><body><p>Hey</p></body></html>")
     with mock.patch("subprocess.run") as patched_subprocess, mock.patch(
         "shutil.which", return_value=True
     ):
+        monkeypatch.delenv("GITHUB_ACTIONS", raising=False)
         display_html(html_file_path=html_file)
         patched_subprocess.assert_called_once()
 

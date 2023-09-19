@@ -16,8 +16,11 @@ on:
         required: false
         default: ""
 
+permissions:
+  contents: read
+
 concurrency:
-  group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.head_ref || github.ref }}
   cancel-in-progress: true
 
 # Use `bash --noprofile --norc -exo pipefail` by default for all `run` steps in this workflow:
@@ -48,6 +51,7 @@ jobs:
         run: |
           echo "::add-matcher::.github/workflows/matchers/pylint.json"
           echo "::add-matcher::.github/workflows/matchers/black.json"
+          echo "::add-matcher::.github/workflows/matchers/ruff.json"
       - name: Install dependencies
         run: |
           pip install -r ${{ github.event.inputs.repository }}/requirements/lint-requirements.txt

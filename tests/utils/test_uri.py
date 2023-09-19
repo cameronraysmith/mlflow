@@ -1,12 +1,16 @@
 import pathlib
 import posixpath
+
 import pytest
 
 from mlflow.exceptions import MlflowException
 from mlflow.store.db.db_types import DATABASE_ENGINES
+from mlflow.utils.os import is_windows
 from mlflow.utils.uri import (
     add_databricks_profile_info_to_artifact_uri,
     append_to_uri_path,
+    append_to_uri_query_params,
+    dbfs_hdfs_uri_to_fuse_path,
     extract_and_normalize_path,
     extract_db_type_from_uri,
     get_databricks_profile_uri_from_artifact_uri,
@@ -14,14 +18,13 @@ from mlflow.utils.uri import (
     get_uri_scheme,
     is_databricks_acled_artifacts_uri,
     is_databricks_uri,
+    is_fuse_or_uc_volumes_uri,
     is_http_uri,
     is_local_uri,
     is_valid_dbfs_uri,
     remove_databricks_profile_info_from_artifact_uri,
-    dbfs_hdfs_uri_to_fuse_path,
     resolve_uri_if_local,
 )
-from mlflow.utils.os import is_windows
 
 
 def test_extract_db_type_from_uri():
@@ -91,6 +94,11 @@ def test_is_local_uri():
     assert is_local_uri("./mlruns")
     assert is_local_uri("file:///foo/mlruns")
     assert is_local_uri("file:foo/mlruns")
+    assert is_local_uri("file://./mlruns")
+    assert is_local_uri("file://localhost/mlruns")
+    assert is_local_uri("file://localhost:5000/mlruns")
+    assert is_local_uri("file://127.0.0.1/mlruns")
+    assert is_local_uri("file://127.0.0.1:5000/mlruns")
 
     assert not is_local_uri("file://myhostname/path/to/file")
     assert not is_local_uri("https://whatever")
@@ -221,6 +229,66 @@ def test_append_to_uri_path_handles_special_uri_characters_in_posixpaths():
             ("$@''(,", ")]*%", "$@''(,/)]*%"),
         ]
     )
+
+
+@pytest.mark.parametrize(
+    ("uri", "existing_query_params", "query_params", "expected"),
+    [
+        ("https://example.com", "", [("key", "value")], "https://example.com?key=value"),
+        (
+            "https://example.com",
+            "existing_key=existing_value",
+            [("new_key", "new_value")],
+            "https://example.com?existing_key=existing_value&new_key=new_value",
+        ),
+        (
+            "https://example.com",
+            "",
+            [("key1", "value1"), ("key2", "value2"), ("key3", "value3")],
+            "https://example.com?key1=value1&key2=value2&key3=value3",
+        ),
+        (
+            "https://example.com",
+            "",
+            [("key", "value with spaces"), ("key2", "special#characters")],
+            "https://example.com?key=value+with+spaces&key2=special%23characters",
+        ),
+        ("", "", [("key", "value")], "?key=value"),
+        ("https://example.com", "", [], "https://example.com"),
+        (
+            "https://example.com",
+            "",
+            [("key1", 123), ("key2", 456)],
+            "https://example.com?key1=123&key2=456",
+        ),
+        (
+            "https://example.com?existing_key=existing_value",
+            "",
+            [("existing_key", "new_value"), ("existing_key", "new_value_2")],
+            "https://example.com?existing_key=existing_value&existing_key=new_value&existing_key=new_value_2",
+        ),
+        (
+            "s3://bucket/key",
+            "prev1=foo&prev2=bar",
+            [("param1", "value1"), ("param2", "value2")],
+            "s3://bucket/key?prev1=foo&prev2=bar&param1=value1&param2=value2",
+        ),
+        (
+            "s3://bucket/key?existing_param=existing_value",
+            "",
+            [("new_param", "new_value")],
+            "s3://bucket/key?existing_param=existing_value&new_param=new_value",
+        ),
+    ],
+)
+def test_append_to_uri_query_params_appends_as_expected(
+    uri, existing_query_params, query_params, expected
+):
+    if existing_query_params:
+        uri += f"?{existing_query_params}"
+
+    result = append_to_uri_query_params(uri, *query_params)
+    assert result == expected
 
 
 def test_append_to_uri_path_preserves_uri_schemes_hosts_queries_and_fragments():
@@ -623,3 +691,34 @@ def test_resolve_uri_if_local(input_uri, expected_uri):
 )
 def test_resolve_uri_if_local_on_windows(input_uri, expected_uri):
     _assert_resolve_uri_if_local(input_uri, expected_uri)
+
+
+@pytest.mark.parametrize(
+    "uri",
+    [
+        "/dbfs/my_path",
+        "dbfs:/my_path",
+        "/Volumes/my_path",
+        "/.fuse-mounts/my_path",
+        "//dbfs////my_path",
+        "///Volumes/",
+        "dbfs://my///path",
+    ],
+)
+def test_correctly_detect_fuse_and_uc_uris(uri):
+    assert is_fuse_or_uc_volumes_uri(uri)
+
+
+@pytest.mark.parametrize(
+    "uri",
+    [
+        "/My_Volumes/my_path",
+        "s3a:/my_path",
+        "Volumes/my_path",
+        "Volume:/my_path",
+        "dbfs/my_path",
+        "/fuse-mounts/my_path",
+    ],
+)
+def test_negative_detection(uri):
+    assert not is_fuse_or_uc_volumes_uri(uri)

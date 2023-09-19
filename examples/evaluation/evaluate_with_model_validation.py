@@ -1,10 +1,10 @@
-import xgboost
 import shap
-from sklearn.model_selection import train_test_split
+import xgboost
 from sklearn.dummy import DummyClassifier
+from sklearn.model_selection import train_test_split
+
 import mlflow
-from mlflow.models import MetricThreshold, make_metric
-from mlflow.models.evaluation.validation import ModelValidationFailedException
+from mlflow.models import MetricThreshold, infer_signature, make_metric
 
 # load UCI Adult Data Set; segment it into training and test sets
 X, y = shap.datasets.adult()
@@ -12,9 +12,11 @@ X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.33, random
 
 # train a candidate XGBoost model
 candidate_model = xgboost.XGBClassifier().fit(X_train, y_train)
+candidate_signature = infer_signature(X_train, candidate_model.predict(X_train))
 
 # train a baseline dummy model
 baseline_model = DummyClassifier(strategy="uniform").fit(X_train, y_train)
+baseline_signature = infer_signature(X_train, baseline_model.predict(X_train))
 
 # construct an evaluation dataset from the test set
 eval_data = X_test
@@ -52,11 +54,15 @@ thresholds = {
 }
 
 with mlflow.start_run() as run:
-    candidate_model_uri = mlflow.sklearn.log_model(candidate_model, "candidate_model").model_uri
+    candidate_model_uri = mlflow.sklearn.log_model(
+        candidate_model, "candidate_model", signature=candidate_signature
+    ).model_uri
     # Note: in most model validation use-cases the baseline model should instead be a previously
     # trained model (such as the current production model), specified directly in the
     # mlflow.evaluate() call via model URI.
-    baseline_model_uri = mlflow.sklearn.log_model(baseline_model, "baseline_model").model_uri
+    baseline_model_uri = mlflow.sklearn.log_model(
+        baseline_model, "baseline_model", signature=baseline_signature
+    ).model_uri
 
     mlflow.evaluate(
         candidate_model_uri,

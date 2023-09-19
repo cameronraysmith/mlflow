@@ -1,7 +1,7 @@
 import React, { useState } from 'react';
 import { IntlProvider } from 'react-intl';
 import { Provider } from 'react-redux';
-import { StaticRouter } from 'react-router-dom';
+import { MemoryRouter } from '../../../../../common/utils/RoutingUtils';
 import { applyMiddleware, compose, createStore } from 'redux';
 import promiseMiddleware from 'redux-promise-middleware';
 import { EXPERIMENT_RUNS_MOCK_STORE } from '../../fixtures/experiment-runs.fixtures';
@@ -61,7 +61,7 @@ const createComponentWrapper = (viewState: SearchExperimentRunsViewState) => () 
       )}
     >
       <IntlProvider locale='en'>
-        <StaticRouter location='/'>
+        <MemoryRouter>
           <GetExperimentRunsContextProvider actions={MOCK_ACTIONS as any}>
             <div
               css={{
@@ -75,10 +75,13 @@ const createComponentWrapper = (viewState: SearchExperimentRunsViewState) => () 
             <ExperimentViewRunsControls
               runsData={MOCK_RUNS_DATA}
               searchFacetsState={searchFacetsState}
+              experimentId={'123'}
               viewState={viewState}
               updateSearchFacets={updateSearchFacets}
               updateViewState={() => {}}
               requestError={null}
+              expandRows={false}
+              updateExpandRows={() => {}}
             />
             <div
               css={{
@@ -100,7 +103,7 @@ const createComponentWrapper = (viewState: SearchExperimentRunsViewState) => () 
               ))}
             </div>
           </GetExperimentRunsContextProvider>
-        </StaticRouter>
+        </MemoryRouter>
       </IntlProvider>
     </Provider>
   );
@@ -110,16 +113,25 @@ export const Default = createComponentWrapper({
   runsSelected: {},
   columnSelectorVisible: false,
   hiddenChildRunsSelected: {},
+  previewPaneVisible: false,
+  artifactViewState: {},
+  viewMaximized: false,
 });
 
 export const WithOneRunSelected = createComponentWrapper({
   runsSelected: { experiment123456789_run1: true, experiment123456789_run2: false },
   columnSelectorVisible: false,
   hiddenChildRunsSelected: {},
+  previewPaneVisible: false,
+  artifactViewState: {},
+  viewMaximized: false,
 });
 
 export const WithTwoRunSelected = createComponentWrapper({
   runsSelected: { experiment123456789_run1: true, experiment123456789_run2: true },
   columnSelectorVisible: false,
   hiddenChildRunsSelected: {},
+  previewPaneVisible: false,
+  artifactViewState: {},
+  viewMaximized: false,
 });

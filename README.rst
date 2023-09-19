@@ -46,21 +46,21 @@ currently run ML code (e.g. in notebooks, standalone applications or the cloud).
     :target: https://twitter.com/MLflow
     :alt: Account Twitter
 
-.. _Slack: https://join.slack.com/t/mlflow-users/shared_invite/zt-1b7gbsopj-ckYE002CMSDR4_Bioztv8g
+.. _Slack: https://join.slack.com/t/mlflow-users/shared_invite/zt-1iffrtbly-UNU8hV03aV8feUeGmqf_uA
 
 Job Statuses
 
 |examples| |cross-version-tests| |r-devel| |test-requirements| |stale| |push-images|
 
-.. |examples| image:: https://img.shields.io/github/actions/workflow/status/mlflow/mlflow/examples.yml?branch=master&event=schedule&label=Examples&style=for-the-badge&logo=github
-    :target: https://github.com/mlflow/mlflow/actions?query=workflow%3AExamples+event%3Aschedule
+.. |examples| image:: https://img.shields.io/github/actions/workflow/status/mlflow-automation/mlflow/examples.yml?branch=master&event=schedule&label=Examples&style=for-the-badge&logo=github
+    :target: https://github.com/mlflow-automation/mlflow/actions/workflows/examples.yml?query=workflow%3AExamples+event%3Aschedule
     :alt: Examples Action Status
-.. |cross-version-tests| image:: https://img.shields.io/github/actions/workflow/status/mlflow/mlflow/cross-version-tests.yml?branch=master&event=schedule&label=Cross%20version%20tests&style=for-the-badge&logo=github
-    :target: https://github.com/mlflow/mlflow/actions?query=workflow%3ACross%2Bversion%2Btests+event%3Aschedule
-.. |r-devel| image:: https://img.shields.io/github/actions/workflow/status/mlflow/mlflow/r.yml?branch=master&event=schedule&label=r-devel&style=for-the-badge&logo=github
-    :target: https://github.com/mlflow/mlflow/actions?query=workflow%3AR+event%3Aschedule
-.. |test-requirements| image:: https://img.shields.io/github/actions/workflow/status/mlflow/mlflow/requirements.yml?branch=master&event=schedule&label=test%20requirements&logo=github&style=for-the-badge
-    :target: https://github.com/mlflow/mlflow/actions?query=workflow%3ATest%2Brequirements+event%3Aschedule
+.. |cross-version-tests| image:: https://img.shields.io/github/actions/workflow/status/mlflow-automation/mlflow/cross-version-tests.yml?branch=master&event=schedule&label=Cross%20version%20tests&style=for-the-badge&logo=github
+    :target: https://github.com/mlflow-automation/mlflow/actions/workflows/cross-version-tests.yml?query=workflow%3A%22Cross+version+tests%22+event%3Aschedule
+.. |r-devel| image:: https://img.shields.io/github/actions/workflow/status/mlflow-automation/mlflow/r.yml?branch=master&event=schedule&label=r-devel&style=for-the-badge&logo=github
+    :target: https://github.com/mlflow-automation/mlflow/actions/workflows/r.yml?query=workflow%3AR+event%3Aschedule
+.. |test-requirements| image:: https://img.shields.io/github/actions/workflow/status/mlflow-automation/mlflow/requirements.yml?branch=master&event=schedule&label=test%20requirements&logo=github&style=for-the-badge
+    :target: https://github.com/mlflow-automation/mlflow/actions/workflows/requirements.yml?query=workflow%3A"Test+requirements"+event%3Aschedule
 .. |stale| image:: https://img.shields.io/github/actions/workflow/status/mlflow/mlflow/stale.yml?branch=master&event=schedule&label=stale&logo=github&style=for-the-badge
     :target: https://github.com/mlflow/mlflow/actions?query=workflow%3AStale+event%3Aschedule
 .. |push-images| image:: https://img.shields.io/github/actions/workflow/status/mlflow/mlflow/push-images.yml?event=release&label=push-images&logo=github&style=for-the-badge
@@ -169,3 +169,15 @@ Contributing
 We happily welcome contributions to MLflow. We are also seeking contributions to items on the
 `MLflow Roadmap <https://github.com/mlflow/mlflow/milestone/3>`_. Please see our
 `contribution guide <CONTRIBUTING.md>`_ to learn more about contributing to MLflow.
+
+Core Members
+------------
+
+MLflow is currently maintained by the following core members with significant contributions from hundreds of exceptionally talented community members.
+
+- `Harutaka Kawamura <https://github.com/harupy>`_
+- `Weichen Xu <https://github.com/WeichenXu123>`_
+- `Corey Zumar <https://github.com/dbczumar>`_
+- `Ben Wilson <https://github.com/BenWilson2>`_
+- `Serena Ruan <https://github.com/serena-ruan>`_
+- `Gabriel Fu <https://github.com/gabrielfu>`_

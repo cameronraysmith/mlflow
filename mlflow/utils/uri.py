@@ -1,13 +1,15 @@
 import pathlib
 import posixpath
+import re
 import urllib.parse
 import uuid
+from typing import Any, Tuple
 
 from mlflow.exceptions import MlflowException
 from mlflow.protos.databricks_pb2 import INVALID_PARAMETER_VALUE
 from mlflow.store.db.db_types import DATABASE_ENGINES
-from mlflow.utils.validation import _validate_db_type_string
 from mlflow.utils.os import is_windows
+from mlflow.utils.validation import _validate_db_type_string
 
 _INVALID_DB_URI_MSG = (
     "Please refer to https://mlflow.org/docs/latest/tracking.html#storage for "
@@ -16,12 +18,21 @@ _INVALID_DB_URI_MSG = (
 
 _DBFS_FUSE_PREFIX = "/dbfs/"
 _DBFS_HDFS_URI_PREFIX = "dbfs:/"
+_UC_VOLUMES_URI_PREFIX = "/Volumes/"
+_UC_DBFS_SYMLINK_PREFIX = "/.fuse-mounts/"
 _DATABRICKS_UNITY_CATALOG_SCHEME = "databricks-uc"
 
 
-def is_local_uri(uri):
-    """Returns true if this is a local file path (/foo or file:/foo)."""
-    if uri == "databricks":
+def is_local_uri(uri, is_tracking_or_registry_uri=True):
+    """
+    Returns true if the specified URI is a local file path (/foo or file:/foo).
+
+    :param uri: The URI.
+    :param is_tracking_uri: Whether or not the specified URI is an MLflow Tracking or MLflow
+                            Model Registry URI. Examples of other URIs are MLflow artifact URIs,
+                            filesystem paths, etc.
+    """
+    if uri == "databricks" and is_tracking_or_registry_uri:
         return False
 
     if is_windows() and uri.startswith("\\\\"):
@@ -29,7 +40,11 @@ def is_local_uri(uri):
         return False
 
     parsed_uri = urllib.parse.urlparse(uri)
-    if parsed_uri.hostname:
+    if parsed_uri.hostname and not (
+        parsed_uri.hostname == "."
+        or parsed_uri.hostname.startswith("localhost")
+        or parsed_uri.hostname.startswith("127.0.0.1")
+    ):
         return False
 
     scheme = parsed_uri.scheme
@@ -40,6 +55,10 @@ def is_local_uri(uri):
         return True
 
     return False
+
+
+def is_file_uri(uri):
+    return urllib.parse.urlparse(uri).scheme == "file"
 
 
 def is_http_uri(uri):
@@ -54,6 +73,25 @@ def is_databricks_uri(uri):
     """
     scheme = urllib.parse.urlparse(uri).scheme
     return scheme == "databricks" or uri == "databricks"
+
+
+def is_fuse_or_uc_volumes_uri(uri):
+    """
+    Validates whether a provided URI is directed to a FUSE mount point or a UC volumes mount point.
+    Multiple directory paths are collapsed into a single designator for root path validation.
+    example:
+    "////Volumes/" will resolve to "/Volumes/" for validation purposes.
+    """
+    resolved_uri = re.sub("/+", "/", uri)
+    return any(
+        resolved_uri.startswith(x)
+        for x in [
+            _DBFS_FUSE_PREFIX,
+            _DBFS_HDFS_URI_PREFIX,
+            _UC_VOLUMES_URI_PREFIX,
+            _UC_DBFS_SYMLINK_PREFIX,
+        ]
+    )
 
 
 def is_databricks_unity_catalog_uri(uri):
@@ -72,18 +110,18 @@ def validate_db_scope_prefix_info(scope, prefix):
     for c in ["/", ":", " "]:
         if c in scope:
             raise MlflowException(
-                "Unsupported Databricks profile name: %s." % scope
-                + " Profile names cannot contain '%s'." % c
+                f"Unsupported Databricks profile name: {scope}."
+                f" Profile names cannot contain '{c}'."
             )
         if prefix and c in prefix:
             raise MlflowException(
-                "Unsupported Databricks profile key prefix: %s." % prefix
-                + " Key prefixes cannot contain '%s'." % c
+                f"Unsupported Databricks profile key prefix: {prefix}."
+                f" Key prefixes cannot contain '{c}'."
             )
     if prefix is not None and prefix.strip() == "":
         raise MlflowException(
-            "Unsupported Databricks profile key prefix: '%s'." % prefix
-            + " Key prefixes cannot be empty."
+            f"Unsupported Databricks profile key prefix: '{prefix}'."
+            " Key prefixes cannot be empty."
         )
 
 
@@ -97,8 +135,8 @@ def get_db_info_from_uri(uri):
         # netloc should not be an empty string unless URI is formatted incorrectly.
         if parsed_uri.netloc == "":
             raise MlflowException(
-                "URI is formatted incorrectly: no netloc in URI '%s'." % uri
-                + " This may be the case if there is only one slash in the URI."
+                f"URI is formatted incorrectly: no netloc in URI '{uri}'."
+                " This may be the case if there is only one slash in the URI."
             )
         profile_tokens = parsed_uri.netloc.split(":")
         parsed_scope = profile_tokens[0]
@@ -241,6 +279,22 @@ def append_to_uri_path(uri, *paths):
     return prefix + urllib.parse.urlunparse(new_parsed_uri)
 
 
+def append_to_uri_query_params(uri, *query_params: Tuple[str, Any]) -> str:
+    """
+    Appends the specified query parameters to an existing URI.
+
+    :param uri: The URI to which to append query parameters.
+    :param query_params: Query parameters to append. Each parameter should
+                         be a 2-element tuple. For example, ``("key", "value")``.
+    """
+    parsed_uri = urllib.parse.urlparse(uri)
+    parsed_query = urllib.parse.parse_qsl(parsed_uri.query)
+    new_parsed_query = parsed_query + list(query_params)
+    new_query = urllib.parse.urlencode(new_parsed_query)
+    new_parsed_uri = parsed_uri._replace(query=new_query)
+    return urllib.parse.urlunparse(new_parsed_uri)
+
+
 def _join_posixpaths_and_append_absolute_suffixes(prefix_path, suffix_path):
     """
     Joins the POSIX path `prefix_path` with the POSIX path `suffix_path`. Unlike posixpath.join(),
@@ -301,8 +355,8 @@ def dbfs_hdfs_uri_to_fuse_path(dbfs_uri):
         dbfs_uri = "dbfs:" + dbfs_uri
     if not dbfs_uri.startswith(_DBFS_HDFS_URI_PREFIX):
         raise MlflowException(
-            "Path '%s' did not start with expected DBFS URI prefix '%s'"
-            % (dbfs_uri, _DBFS_HDFS_URI_PREFIX),
+            f"Path '{dbfs_uri}' did not start with expected DBFS URI "
+            f"prefix '{_DBFS_HDFS_URI_PREFIX}'",
         )
 
     return _DBFS_FUSE_PREFIX + dbfs_uri[len(_DBFS_HDFS_URI_PREFIX) :]
@@ -337,7 +391,7 @@ def resolve_uri_if_local(local_uri):
                     )
                 return cwd.joinpath(local_path).as_posix()
             local_uri_split = urllib.parse.urlsplit(local_uri)
-            resolved_absolute_uri = urllib.parse.urlunsplit(
+            return urllib.parse.urlunsplit(
                 (
                     local_uri_split.scheme,
                     None,
@@ -346,7 +400,6 @@ def resolve_uri_if_local(local_uri):
                     local_uri_split.fragment,
                 )
             )
-            return resolved_absolute_uri
     return local_uri
 
 

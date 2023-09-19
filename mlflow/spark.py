@@ -18,59 +18,62 @@ Spark MLlib (native) format
     ``mlflow/java`` package. This flavor is produced only if you specify
     MLeap-compatible arguments.
 """
-import os
 import logging
+import os
 import posixpath
 import re
 import shutil
+from typing import Any, Dict, Optional
+
+import pandas as pd
 import yaml
+from packaging.version import Version
 
 import mlflow
-from mlflow import environment_variables, pyfunc, mleap
+from mlflow import environment_variables, mleap, pyfunc
 from mlflow.environment_variables import MLFLOW_DFS_TMP
 from mlflow.exceptions import MlflowException
-from mlflow.models import Model
+from mlflow.models import Model, ModelInputExample, ModelSignature, infer_signature
 from mlflow.models.model import MLMODEL_FILE_NAME
-from mlflow.models.signature import ModelSignature
-from mlflow.models.utils import ModelInputExample, _save_example
+from mlflow.models.signature import _LOG_MODEL_INFER_SIGNATURE_WARNING_TEMPLATE
+from mlflow.models.utils import _Example, _save_example
 from mlflow.protos.databricks_pb2 import INVALID_PARAMETER_VALUE
+from mlflow.store.artifact.databricks_artifact_repo import DatabricksArtifactRepository
+from mlflow.tracking._model_registry import DEFAULT_AWAIT_MAX_SLEEP_SECONDS
 from mlflow.tracking.artifact_utils import (
     _download_artifact_from_uri,
     _get_root_uri_and_artifact_path,
 )
+from mlflow.utils import databricks_utils
+from mlflow.utils.autologging_utils import autologging_integration, safe_patch
+from mlflow.utils.docstring_utils import LOG_MODEL_PARAM_DOCS, format_docstring
 from mlflow.utils.environment import (
-    _mlflow_conda_env,
-    _validate_env_arguments,
-    _process_pip_requirements,
-    _process_conda_env,
     _CONDA_ENV_FILE_NAME,
-    _REQUIREMENTS_FILE_NAME,
     _CONSTRAINTS_FILE_NAME,
     _PYTHON_ENV_FILE_NAME,
+    _REQUIREMENTS_FILE_NAME,
+    _mlflow_conda_env,
+    _process_conda_env,
+    _process_pip_requirements,
     _PythonEnv,
+    _validate_env_arguments,
 )
-from mlflow.utils.requirements_utils import _get_pinned_requirement
-from mlflow.utils.docstring_utils import format_docstring, LOG_MODEL_PARAM_DOCS
-from mlflow.store.artifact.databricks_artifact_repo import DatabricksArtifactRepository
-from mlflow.utils.file_utils import TempDir, write_to, shutil_copytree_without_file_permissions
-from mlflow.utils.uri import (
-    is_local_uri,
-    append_to_uri_path,
-    dbfs_hdfs_uri_to_fuse_path,
-    is_valid_dbfs_uri,
-    is_databricks_acled_artifacts_uri,
-    get_databricks_profile_uri_from_artifact_uri,
-    generate_tmp_dfs_path,
-)
-from mlflow.utils import databricks_utils
+from mlflow.utils.file_utils import TempDir, shutil_copytree_without_file_permissions, write_to
 from mlflow.utils.model_utils import (
+    _add_code_from_conf_to_system_path,
     _get_flavor_configuration_from_uri,
     _validate_and_copy_code_paths,
-    _add_code_from_conf_to_system_path,
 )
-from mlflow.tracking._model_registry import DEFAULT_AWAIT_MAX_SLEEP_SECONDS
-from mlflow.utils.autologging_utils import autologging_integration, safe_patch
-
+from mlflow.utils.requirements_utils import _get_pinned_requirement
+from mlflow.utils.uri import (
+    append_to_uri_path,
+    dbfs_hdfs_uri_to_fuse_path,
+    generate_tmp_dfs_path,
+    get_databricks_profile_uri_from_artifact_uri,
+    is_databricks_acled_artifacts_uri,
+    is_local_uri,
+    is_valid_dbfs_uri,
+)
 
 FLAVOR_NAME = "spark"
 
@@ -86,10 +89,16 @@ def get_default_pip_requirements():
              Calls to :func:`save_model()` and :func:`log_model()` produce a pip environment
              that, at minimum, contains these requirements.
     """
+    import pyspark
+
     # Strip the suffix from `dev` versions of PySpark, which are not
     # available for installation from Anaconda or PyPI
     pyspark_req = re.sub(r"(\.?)dev.*$", "", _get_pinned_requirement("pyspark"))
-    return [pyspark_req]
+    reqs = [pyspark_req]
+    if Version(pyspark.__version__) < Version("3.4"):
+        # Versions of PySpark < 3.4 are incompatible with pandas >= 2
+        reqs.append("pandas<2")
+    return reqs
 
 
 def get_default_conda_env():
@@ -159,26 +168,8 @@ def log_model(
     :param registered_model_name: If given, create a model version under
                                   ``registered_model_name``, also creating a registered model if one
                                   with the given name does not exist.
-
-    :param signature: :py:class:`ModelSignature <mlflow.models.ModelSignature>`
-                      describes model input and output :py:class:`Schema <mlflow.types.Schema>`.
-                      The model signature can be :py:func:`inferred <mlflow.models.infer_signature>`
-                      from datasets with valid model input (e.g. the training dataset with target
-                      column omitted) and valid model output (e.g. model predictions generated on
-                      the training dataset), for example:
-
-                      .. code-block:: python
-
-                        from mlflow.models.signature import infer_signature
-
-                        train = df.drop_column("target_label")
-                        predictions = ...  # compute model predictions
-                        signature = infer_signature(train, predictions)
-    :param input_example: Input example provides one or several instances of valid
-                          model input. The example can be used as a hint of what data to feed the
-                          model. The given example will be converted to a Pandas DataFrame and then
-                          serialized to json using the Pandas split-oriented format. Bytes are
-                          base64-encoded.
+    :param signature: {{ signature }}
+    :param input_example: {{ input_example }}
     :param await_registration_for: Number of seconds to wait for the model version to finish
                             being created and is in ``READY`` status. By default, the function
                             waits for five minutes. Specify 0 or None to skip waiting.
@@ -563,9 +554,9 @@ def _save_model_metadata(
 
 
 def _validate_model(spark_model):
-    from pyspark.ml.util import MLReadable, MLWritable
     from pyspark.ml import Model as PySparkModel
     from pyspark.ml import Transformer as PySparkTransformer
+    from pyspark.ml.util import MLReadable, MLWritable
 
     if (
         (
@@ -635,25 +626,8 @@ def save_model(
                          This must be a PySpark DataFrame that the model can evaluate. If
                          ``sample_input`` is ``None``, the MLeap flavor is not added.
 
-    :param signature: :py:class:`ModelSignature <mlflow.models.ModelSignature>`
-                      describes model input and output :py:class:`Schema <mlflow.types.Schema>`.
-                      The model signature can be :py:func:`inferred <mlflow.models.infer_signature>`
-                      from datasets with valid model input (e.g. the training dataset with target
-                      column omitted) and valid model output (e.g. model predictions generated on
-                      the training dataset), for example:
-
-                      .. code-block:: python
-
-                        from mlflow.models.signature import infer_signature
-
-                        train = df.drop_column("target_label")
-                        predictions = ...  # compute model predictions
-                        signature = infer_signature(train, predictions)
-    :param input_example: Input example provides one or several instances of valid
-                          model input. The example can be used as a hint of what data to feed the
-                          model. The given example will be converted to a Pandas DataFrame and then
-                          serialized to json using the Pandas split-oriented format. Bytes are
-                          base64-encoded.
+    :param signature: {{ signature }}
+    :param input_example: {{ input_example }}
     :param pip_requirements: {{ pip_requirements }}
     :param extra_pip_requirements: {{ extra_pip_requirements }}
     :param metadata: Custom metadata dictionary passed to the model and stored in the MLmodel file.
@@ -676,12 +650,37 @@ def save_model(
 
     from pyspark.ml import PipelineModel
 
+    from mlflow.utils._spark_utils import _get_active_spark_session
+
     if not isinstance(spark_model, PipelineModel):
         spark_model = PipelineModel([spark_model])
     if mlflow_model is None:
         mlflow_model = Model()
     if metadata is not None:
         mlflow_model.metadata = metadata
+
+    # for automatic signature inference, we use an inline implementation rather than the
+    # `_infer_signature_from_input_example` API because we need to convert model predictions from a
+    # list into a Pandas series for signature inference.
+    if signature is None and input_example is not None:
+        input_ex = _Example(input_example).inference_data
+        try:
+            spark = _get_active_spark_session()
+            if spark is not None:
+                wrapped_model = _PyFuncModelWrapper(spark, spark_model)
+                # We cast the predictions to a Pandas series because the Spark _PyFuncModelWrapper
+                # returns predictions as a list, which the `infer_signature` API does not support
+                # (unless it is a list of strings).
+                prediction = pd.Series(wrapped_model.predict(input_ex))
+                signature = infer_signature(input_ex, prediction)
+        except Exception as e:
+            if environment_variables._MLFLOW_TESTING.get():
+                raise
+            _logger.warning(_LOG_MODEL_INFER_SIGNATURE_WARNING_TEMPLATE, repr(e))
+            _logger.debug("", exc_info=True)
+    elif signature is False:
+        signature = None
+
     # Spark ML stores the model on DFS if running on a cluster
     # Save it to a DFS temp dir first and copy it to local path
     if dfs_tmpdir is None:
@@ -854,9 +853,9 @@ def _find_and_set_features_col_as_vector_if_needed(spark_df, spark_model):
     :param spark_model: A pipeline model or a single transformer that contains `featuresCol` param
     :return: A spark dataframe that contains features column of `vector` type.
     """
-    from pyspark.sql.functions import udf
     from pyspark.ml.linalg import Vectors, VectorUDT
     from pyspark.sql import types as t
+    from pyspark.sql.functions import udf
 
     def _find_stage_with_features_col(stage):
         if stage.hasParam("featuresCol"):
@@ -894,11 +893,18 @@ class _PyFuncModelWrapper:
         self.spark = spark
         self.spark_model = spark_model
 
-    def predict(self, pandas_df):
+    def predict(
+        self, pandas_df, params: Optional[Dict[str, Any]] = None  # pylint: disable=unused-argument
+    ):
         """
         Generate predictions given input data in a pandas DataFrame.
 
         :param pandas_df: pandas DataFrame containing input data.
+        :param params: Additional parameters to pass to the model for inference.
+
+                       .. Note:: Experimental: This parameter may change or be removed in a future
+                                               release without warning.
+
         :return: List with model predictions.
         """
         from pyspark.ml import PipelineModel
@@ -991,10 +997,13 @@ def autolog(disable=False, silent=False):  # pylint: disable=unused-argument
                    datasource autologging. If ``False``, show all events and warnings during Spark
                    datasource autologging.
     """
-    from mlflow.utils._spark_utils import _get_active_spark_session
-    from mlflow._spark_autologging import _listen_for_spark_activity
     from pyspark.sql import SparkSession
-    from pyspark import SparkContext
+
+    from mlflow._spark_autologging import (
+        _listen_for_spark_activity,
+        _stop_listen_for_spark_activity,
+    )
+    from mlflow.utils._spark_utils import _get_active_spark_session
 
     def __init__(original, self, *args, **kwargs):
         original(self, *args, **kwargs)
@@ -1003,9 +1012,18 @@ def autolog(disable=False, silent=False):  # pylint: disable=unused-argument
 
     safe_patch(FLAVOR_NAME, SparkSession, "__init__", __init__, manage_run=False)
 
+    def patched_session_stop(original, self, *args, **kwargs):
+        _stop_listen_for_spark_activity(self.sparkContext)
+        original(self, *args, **kwargs)
+
+    safe_patch(FLAVOR_NAME, SparkSession, "stop", patched_session_stop, manage_run=False)
+
     active_session = _get_active_spark_session()
     if active_session is not None:
         # We know SparkContext exists here already, so get it
-        sc = SparkContext.getOrCreate()
+        sc = active_session.sparkContext
 
-        _listen_for_spark_activity(sc)
+        if disable:
+            _stop_listen_for_spark_activity(sc)
+        else:
+            _listen_for_spark_activity(sc)

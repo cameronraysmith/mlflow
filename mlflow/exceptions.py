@@ -1,30 +1,49 @@
 import json
 
 from mlflow.protos.databricks_pb2 import (
-    INTERNAL_ERROR,
-    TEMPORARILY_UNAVAILABLE,
-    ENDPOINT_NOT_FOUND,
-    PERMISSION_DENIED,
-    CUSTOMER_UNAUTHORIZED,
-    REQUEST_LIMIT_EXCEEDED,
+    ABORTED,
+    ALREADY_EXISTS,
     BAD_REQUEST,
+    CANCELLED,
+    CUSTOMER_UNAUTHORIZED,
+    DATA_LOSS,
+    DEADLINE_EXCEEDED,
+    ENDPOINT_NOT_FOUND,
+    INTERNAL_ERROR,
     INVALID_PARAMETER_VALUE,
-    RESOURCE_DOES_NOT_EXIST,
     INVALID_STATE,
+    NOT_FOUND,
+    NOT_IMPLEMENTED,
+    PERMISSION_DENIED,
+    REQUEST_LIMIT_EXCEEDED,
     RESOURCE_ALREADY_EXISTS,
+    RESOURCE_CONFLICT,
+    RESOURCE_DOES_NOT_EXIST,
+    RESOURCE_EXHAUSTED,
+    TEMPORARILY_UNAVAILABLE,
+    UNAUTHENTICATED,
     ErrorCode,
 )
-
 
 ERROR_CODE_TO_HTTP_STATUS = {
     ErrorCode.Name(INTERNAL_ERROR): 500,
     ErrorCode.Name(INVALID_STATE): 500,
+    ErrorCode.Name(DATA_LOSS): 500,
+    ErrorCode.Name(NOT_IMPLEMENTED): 501,
     ErrorCode.Name(TEMPORARILY_UNAVAILABLE): 503,
+    ErrorCode.Name(DEADLINE_EXCEEDED): 504,
     ErrorCode.Name(REQUEST_LIMIT_EXCEEDED): 429,
+    ErrorCode.Name(CANCELLED): 499,
+    ErrorCode.Name(RESOURCE_EXHAUSTED): 429,
+    ErrorCode.Name(ABORTED): 409,
+    ErrorCode.Name(RESOURCE_CONFLICT): 409,
+    ErrorCode.Name(ALREADY_EXISTS): 409,
+    ErrorCode.Name(NOT_FOUND): 404,
     ErrorCode.Name(ENDPOINT_NOT_FOUND): 404,
     ErrorCode.Name(RESOURCE_DOES_NOT_EXIST): 404,
     ErrorCode.Name(PERMISSION_DENIED): 403,
     ErrorCode.Name(CUSTOMER_UNAUTHORIZED): 401,
+    ErrorCode.Name(UNAUTHENTICATED): 401,
     ErrorCode.Name(BAD_REQUEST): 400,
     ErrorCode.Name(RESOURCE_ALREADY_EXISTS): 400,
     ErrorCode.Name(INVALID_PARAMETER_VALUE): 400,
@@ -111,5 +130,11 @@ class ExecutionException(MlflowException):
 
 class MissingConfigException(MlflowException):
     """Exception thrown when expected configuration file/directory not found"""
+
+    pass
+
+
+class InvalidUrlException(MlflowException):
+    """Exception thrown when a http request fails to send due to an invalid URL"""
 
     pass

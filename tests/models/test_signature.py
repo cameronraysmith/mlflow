@@ -1,11 +1,17 @@
 import json
+
 import numpy as np
 import pandas as pd
 import pyspark
+import pytest
+from sklearn.ensemble import RandomForestRegressor
 
-from mlflow.models.signature import ModelSignature, infer_signature
+import mlflow
+from mlflow.exceptions import MlflowException
+from mlflow.models import Model, ModelSignature, infer_signature, set_signature
+from mlflow.models.model import get_model_info
 from mlflow.types import DataType
-from mlflow.types.schema import Schema, ColSpec, TensorSpec
+from mlflow.types.schema import ColSpec, ParamSchema, ParamSpec, Schema, TensorSpec
 
 
 def test_model_signature_with_colspec():
@@ -124,6 +130,27 @@ def test_signature_inference_infers_input_and_output_as_expected():
     assert sig1.outputs == sig0.inputs
 
 
+def test_infer_signature_on_list_of_dictionaries():
+    signature = infer_signature(
+        model_input=[{"query": "test query"}],
+        model_output=[
+            {
+                "output": "Output from the LLM",
+                "candidate_ids": ["412", "1233"],
+                "candidate_sources": ["file1.md", "file201.md"],
+            }
+        ],
+    )
+    assert signature.inputs == Schema([ColSpec(DataType.string, name="query")])
+    assert signature.outputs == Schema(
+        [
+            ColSpec(DataType.string, name="output"),
+            ColSpec(DataType.string, name="candidate_ids"),
+            ColSpec(DataType.string, name="candidate_sources"),
+        ]
+    )
+
+
 def test_signature_inference_infers_datime_types_as_expected():
     col_name = "datetime_col"
     test_datetime = np.datetime64("2021-01-01")
@@ -144,3 +171,86 @@ def test_signature_inference_infers_datime_types_as_expected():
     assert signature.inputs == Schema(
         [ColSpec(DataType.datetime, name="timestamp"), ColSpec(DataType.datetime, name="date")]
     )
+
+
+def test_set_signature_to_logged_model():
+    artifact_path = "regr-model"
+    with mlflow.start_run() as run:
+        mlflow.sklearn.log_model(sk_model=RandomForestRegressor(), artifact_path=artifact_path)
+    signature = infer_signature(np.array([1]))
+    run_id = run.info.run_id
+    model_uri = f"runs:/{run_id}/{artifact_path}"
+    set_signature(model_uri, signature)
+    model_info = get_model_info(model_uri)
+    assert model_info.signature == signature
+
+
+def test_set_signature_to_saved_model(tmp_path):
+    model_path = str(tmp_path)
+    mlflow.sklearn.save_model(
+        RandomForestRegressor(),
+        model_path,
+        serialization_format=mlflow.sklearn.SERIALIZATION_FORMAT_CLOUDPICKLE,
+    )
+    signature = infer_signature(np.array([1]))
+    set_signature(model_path, signature)
+    assert Model.load(model_path).signature == signature
+
+
+def test_set_signature_overwrite():
+    artifact_path = "regr-model"
+    with mlflow.start_run() as run:
+        mlflow.sklearn.log_model(
+            sk_model=RandomForestRegressor(),
+            artifact_path=artifact_path,
+            signature=infer_signature(np.array([1])),
+        )
+    new_signature = infer_signature(np.array([1]), np.array([1]))
+    run_id = run.info.run_id
+    model_uri = f"runs:/{run_id}/{artifact_path}"
+    set_signature(model_uri, new_signature)
+    model_info = get_model_info(model_uri)
+    assert model_info.signature == new_signature
+
+
+def test_cannot_set_signature_on_models_scheme_uris():
+    signature = infer_signature(np.array([1]))
+    with pytest.raises(
+        MlflowException, match="Model URIs with the `models:/` scheme are not supported."
+    ):
+        set_signature("models:/dummy_model@champion", signature)
+
+
+def test_signature_construction():
+    signature = ModelSignature(inputs=Schema([ColSpec(DataType.binary)]))
+    assert signature.to_dict() == {
+        "inputs": '[{"type": "binary"}]',
+        "outputs": None,
+        "params": None,
+    }
+
+    signature = ModelSignature(outputs=Schema([ColSpec(DataType.double)]))
+    assert signature.to_dict() == {
+        "inputs": None,
+        "outputs": '[{"type": "double"}]',
+        "params": None,
+    }
+
+    signature = ModelSignature(params=ParamSchema([ParamSpec("param1", DataType.string, "test")]))
+    assert signature.to_dict() == {
+        "inputs": None,
+        "outputs": None,
+        "params": '[{"name": "param1", "type": "string", "default": "test", "shape": null}]',
+    }
+
+
+def test_signature_with_errors():
+    with pytest.raises(
+        TypeError, match=r"inputs must be either None or mlflow.models.signature.Schema"
+    ):
+        ModelSignature(inputs=1)
+
+    with pytest.raises(
+        ValueError, match=r"At least one of inputs, outputs or params must be provided"
+    ):
+        ModelSignature()

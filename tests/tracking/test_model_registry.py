@@ -3,14 +3,16 @@ Integration test which starts a local Tracking Server on an ephemeral port,
 and ensures we can use the tracking API to communicate with it.
 """
 import time
+
 import pytest
 
-from mlflow.entities.model_registry import RegisteredModel, ModelVersion
-from mlflow.exceptions import MlflowException
 from mlflow import MlflowClient
-from mlflow.utils.time_utils import get_current_time_millis
+from mlflow.entities.model_registry import ModelVersion, RegisteredModel
+from mlflow.exceptions import MlflowException
 from mlflow.utils.os import is_windows
-from tests.tracking.integration_test_utils import _terminate_server, _init_server
+from mlflow.utils.time import get_current_time_millis
+
+from tests.tracking.integration_test_utils import _init_server
 
 
 @pytest.fixture(params=["file", "sqlalchemy"])
@@ -21,11 +23,10 @@ def client(request, tmp_path):
         path = tmp_path.joinpath("sqlalchemy.db").as_uri()
         backend_uri = ("sqlite://" if is_windows() else "sqlite:////") + path[len("file://") :]
 
-    url, process = _init_server(
+    with _init_server(
         backend_uri=backend_uri, root_artifact_uri=tmp_path.joinpath("artifacts").as_uri()
-    )
-    yield MlflowClient(url)
-    _terminate_server(process)
+    ) as url:
+        yield MlflowClient(url)
 
 
 def assert_is_between(start_time, end_time, expected_time):
@@ -417,7 +418,7 @@ def test_create_and_query_model_version_flow(client):
     assert [rm.latest_versions for rm in client.search_registered_models() if rm.name == name] == [
         [mvd2]
     ]
-    model_versions_by_name = client.search_model_versions("name = '%s'" % name)
+    model_versions_by_name = client.search_model_versions(f"name = '{name}'")
     assert {mv.version for mv in model_versions_by_name} == {"1", "2"}
     assert {mv.name for mv in model_versions_by_name} == {name}
 
@@ -581,7 +582,7 @@ def test_delete_model_version_flow(client):
     ]
     assert len(model_versions_detailed) == 1
     assert model_versions_detailed[0][0].version == "3"
-    assert {mv.version for mv in client.search_model_versions("name = '%s'" % name)} == {
+    assert {mv.version for mv in client.search_model_versions(f"name = '{name}'")} == {
         "1",
         "2",
         "3",
@@ -590,7 +591,7 @@ def test_delete_model_version_flow(client):
     start_time_2 = get_current_time_millis()
     client.delete_model_version(name, "1")
     end_time_2 = get_current_time_millis()
-    assert {mv.version for mv in client.search_model_versions("name = '%s'" % name)} == {
+    assert {mv.version for mv in client.search_model_versions(f"name = '{name}'")} == {
         "2",
         "3",
     }
@@ -610,13 +611,13 @@ def test_delete_model_version_flow(client):
         client.transition_model_version_stage(name=name, version=1, stage="Staging")
 
     client.delete_model_version(name, 3)
-    assert {mv.version for mv in client.search_model_versions("name = '%s'" % name)} == {"2"}
+    assert {mv.version for mv in client.search_model_versions(f"name = '{name}'")} == {"2"}
 
     # new model versions will not reuse existing version numbers
     mv4 = client.create_model_version(name, "runs:/run_id_2/a/b/c", "run_id_2")
     assert mv4.version == "4"
     assert mv4.name == name
-    assert {mv.version for mv in client.search_model_versions("name = '%s'" % name)} == {
+    assert {mv.version for mv in client.search_model_versions(f"name = '{name}'")} == {
         "2",
         "4",
     }
@@ -644,3 +645,25 @@ def test_set_model_version_tag_with_empty_string_as_value(client):
     client.create_model_version(name, "runs:/run_id/model", "run_id_1")
     client.set_model_version_tag(name, "1", "tag_key", "")
     assert {"tag_key": ""}.items() <= client.get_model_version(name, "1").tags.items()
+
+
+def test_set_delete_registered_model_alias_and_get_model_version_by_alias_flow(client):
+    name = "SetDeleteGetRMAliasTest"
+    client.create_registered_model(name)
+    client.create_model_version(name, "runs:/run_id/model", "run_id_1")
+    model = client.get_registered_model(name)
+    assert model.aliases == {}
+    mv = client.get_model_version(name, "1")
+    assert mv.aliases == []
+    client.set_registered_model_alias(name, "test_alias", "1")
+    model = client.get_registered_model(name)
+    assert model.aliases == {"test_alias": "1"}
+    mv = client.get_model_version(name, "1")
+    assert mv.aliases == ["test_alias"]
+    mv_alias = client.get_model_version_by_alias(name, "test_alias")
+    assert mv == mv_alias
+    client.delete_registered_model_alias(name, "test_alias")
+    model = client.get_registered_model(name)
+    assert model.aliases == {}
+    mv = client.get_model_version(name, "1")
+    assert mv.aliases == []

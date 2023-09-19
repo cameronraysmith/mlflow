@@ -2,20 +2,20 @@
 Getting started with Captum - Titanic Data Analysis
 """
 # Initial imports
-import numpy as np
-import torch
-from captum.attr import IntegratedGradients
-from captum.attr import LayerConductance
-from captum.attr import NeuronConductance
-import matplotlib.pyplot as plt
-import pandas as pd
-from scipy import stats
-import mlflow
-from prettytable import PrettyTable
-from sklearn.model_selection import train_test_split
 import os
 from argparse import ArgumentParser
-import torch.nn as nn
+
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+import torch
+from captum.attr import IntegratedGradients, LayerConductance, NeuronConductance
+from prettytable import PrettyTable
+from scipy import stats
+from sklearn.model_selection import train_test_split
+from torch import nn
+
+import mlflow
 
 
 def get_titanic():
@@ -43,9 +43,9 @@ def get_titanic():
     titanic_data = pd.concat(
         [
             titanic_data,
-            pd.get_dummies(titanic_data["sex"]),
-            pd.get_dummies(titanic_data["embarked"], prefix="embark"),
-            pd.get_dummies(titanic_data["pclass"], prefix="class"),
+            pd.get_dummies(titanic_data["sex"], dtype=np.uint8),
+            pd.get_dummies(titanic_data["embarked"], prefix="embark", dtype=np.uint8),
+            pd.get_dummies(titanic_data["pclass"], prefix="class", dtype=np.uint8),
         ],
         axis=1,
     )
@@ -92,6 +92,8 @@ class TitanicSimpleNNModel(nn.Module):
 def prepare():
     RANDOM_SEED = 42
     titanic_data = get_titanic()
+    print(titanic_data)
+
     labels = titanic_data["survived"].to_numpy()
     titanic_data = titanic_data.drop(["survived"], axis=1)
     feature_names = list(titanic_data.columns)
@@ -100,7 +102,9 @@ def prepare():
     train_features, test_features, train_labels, test_labels = train_test_split(
         data, labels, test_size=0.3, random_state=RANDOM_SEED, stratify=labels
     )
-    return (train_features, train_labels, test_features, test_labels, feature_names)
+    train_features = np.vstack(train_features[:, :]).astype(np.float32)
+    test_features = np.vstack(test_features[:, :]).astype(np.float32)
+    return train_features, train_labels, test_features, test_labels, feature_names
 
 
 def count_model_parameters(model):
@@ -156,6 +160,7 @@ def train(USE_PRETRAINED_MODEL=False):
         mlflow.log_param("lr", dict_args["lr"])
 
         optimizer = torch.optim.Adam(net.parameters(), lr=dict_args["lr"])
+        print(train_features.dtype)
         input_tensor = torch.from_numpy(train_features).type(torch.FloatTensor)
         label_tensor = torch.from_numpy(train_labels)
         for epoch in range(num_epochs):
@@ -165,11 +170,9 @@ def train(USE_PRETRAINED_MODEL=False):
             loss.backward()
             optimizer.step()
             if epoch % 50 == 0:
-                print(
-                    "Epoch {}/{} => Train Loss: {:.2f}".format(epoch + 1, num_epochs, loss.item())
-                )
+                print(f"Epoch {epoch + 1}/{num_epochs} => Train Loss: {loss.item():.2f}")
                 mlflow.log_metric(
-                    "Epoch {} Loss".format(str(epoch + 1)),
+                    f"Epoch {epoch + 1!s} Loss",
                     float(loss.item()),
                     step=epoch,
                 )
@@ -298,7 +301,7 @@ def neuron_conductance(net, test_input_tensor, neuron_selector=None):
     neuron_cond, _ = visualize_importances(
         feature_names,
         neuron_cond_vals.mean(dim=0).detach().numpy(),
-        title="Average Feature Importances for Neuron {}".format(neuron_selector),
+        title=f"Average Feature Importances for Neuron {neuron_selector}",
     )
     mlflow.log_text(
         str(neuron_cond), "Avg_Feature_Importances_Neuron_" + str(neuron_selector) + ".txt"

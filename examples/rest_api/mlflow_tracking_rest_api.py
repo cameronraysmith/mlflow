@@ -11,9 +11,11 @@ https://www.mlflow.org/docs/latest/rest-api.html
 
 import argparse
 import os
+import pwd
+
 import requests
 
-from mlflow.utils.time_utils import get_current_time_millis
+from mlflow.utils.time import get_current_time_millis
 
 _DEFAULT_USER_ID = "unknown"
 
@@ -74,8 +76,6 @@ class MLflowTrackingRestApi:
 def _get_user_id():
     """Get the ID of the user for the current run."""
     try:
-        import pwd
-
         return pwd.getpwuid(os.getuid())[0]
     except ImportError:
         return _DEFAULT_USER_ID

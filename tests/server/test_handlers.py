@@ -1,92 +1,95 @@
 import json
 import uuid
-
-import pytest
 from unittest import mock
 
-import os
+import pytest
+
 import mlflow
 from mlflow.entities import ViewType
 from mlflow.entities.model_registry import (
-    RegisteredModel,
     ModelVersion,
-    RegisteredModelTag,
     ModelVersionTag,
+    RegisteredModel,
+    RegisteredModelTag,
 )
 from mlflow.exceptions import MlflowException
 from mlflow.protos.databricks_pb2 import INTERNAL_ERROR, INVALID_PARAMETER_VALUE, ErrorCode
-from mlflow.server.handlers import (
-    get_endpoints,
-    _create_experiment,
-    _get_request_message,
-    _search_runs,
-    _log_batch,
-    catch_mlflow_exception,
-    _create_registered_model,
-    _update_registered_model,
-    _delete_registered_model,
-    _get_registered_model,
-    _search_registered_models,
-    _get_latest_versions,
-    _create_model_version,
-    _update_model_version,
-    _delete_model_version,
-    _get_model_version_download_uri,
-    _search_model_versions,
-    _get_model_version,
-    _transition_stage,
-    _rename_registered_model,
-    _set_registered_model_tag,
-    _delete_registered_model_tag,
-    _set_model_version_tag,
-    _delete_model_version_tag,
-    _guess_mime_type,
-)
-from mlflow.server import BACKEND_STORE_URI_ENV_VAR, app
-from mlflow.store.entities.paged_list import PagedList
-from mlflow.protos.service_pb2 import CreateExperiment, SearchRuns
-from mlflow.store.model_registry import (
-    SEARCH_REGISTERED_MODEL_MAX_RESULTS_DEFAULT,
-    SEARCH_MODEL_VERSION_MAX_RESULTS_THRESHOLD,
-)
 from mlflow.protos.model_registry_pb2 import (
-    CreateRegisteredModel,
-    UpdateRegisteredModel,
-    DeleteRegisteredModel,
-    SearchRegisteredModels,
-    GetRegisteredModel,
-    GetLatestVersions,
     CreateModelVersion,
-    UpdateModelVersion,
+    CreateRegisteredModel,
     DeleteModelVersion,
-    GetModelVersion,
-    GetModelVersionDownloadUri,
-    SearchModelVersions,
-    TransitionModelVersionStage,
-    RenameRegisteredModel,
-    SetRegisteredModelTag,
-    DeleteRegisteredModelTag,
-    SetModelVersionTag,
     DeleteModelVersionTag,
+    DeleteRegisteredModel,
+    DeleteRegisteredModelAlias,
+    DeleteRegisteredModelTag,
+    GetLatestVersions,
+    GetModelVersion,
+    GetModelVersionByAlias,
+    GetModelVersionDownloadUri,
+    GetRegisteredModel,
+    RenameRegisteredModel,
+    SearchModelVersions,
+    SearchRegisteredModels,
+    SetModelVersionTag,
+    SetRegisteredModelAlias,
+    SetRegisteredModelTag,
+    TransitionModelVersionStage,
+    UpdateModelVersion,
+    UpdateRegisteredModel,
+)
+from mlflow.protos.service_pb2 import CreateExperiment, SearchRuns
+from mlflow.server import BACKEND_STORE_URI_ENV_VAR, app
+from mlflow.server.handlers import (
+    _create_experiment,
+    _create_model_version,
+    _create_registered_model,
+    _delete_model_version,
+    _delete_model_version_tag,
+    _delete_registered_model,
+    _delete_registered_model_alias,
+    _delete_registered_model_tag,
+    _get_latest_versions,
+    _get_model_version,
+    _get_model_version_by_alias,
+    _get_model_version_download_uri,
+    _get_registered_model,
+    _get_request_message,
+    _log_batch,
+    _rename_registered_model,
+    _search_model_versions,
+    _search_registered_models,
+    _search_runs,
+    _set_model_version_tag,
+    _set_registered_model_alias,
+    _set_registered_model_tag,
+    _transition_stage,
+    _update_model_version,
+    _update_registered_model,
+    catch_mlflow_exception,
+    get_endpoints,
+)
+from mlflow.store.entities.paged_list import PagedList
+from mlflow.store.model_registry import (
+    SEARCH_MODEL_VERSION_MAX_RESULTS_THRESHOLD,
+    SEARCH_REGISTERED_MODEL_MAX_RESULTS_DEFAULT,
 )
 from mlflow.utils.proto_json_utils import message_to_json
 from mlflow.utils.validation import MAX_BATCH_LOG_REQUEST_SIZE
-from mlflow.utils.os import is_windows
 
 
-@pytest.fixture()
+@pytest.fixture
 def mock_get_request_message():
     with mock.patch("mlflow.server.handlers._get_request_message") as m:
         yield m
 
 
-@pytest.fixture()
+@pytest.fixture
 def mock_get_request_json():
     with mock.patch("mlflow.server.handlers._get_request_json") as m:
         yield m
 
 
-@pytest.fixture()
+@pytest.fixture
 def mock_tracking_store():
     with mock.patch("mlflow.server.handlers._get_tracking_store") as m:
         mock_store = mock.MagicMock()
@@ -94,7 +97,7 @@ def mock_tracking_store():
         yield mock_store
 
 
-@pytest.fixture()
+@pytest.fixture
 def mock_model_registry_store():
     with mock.patch("mlflow.server.handlers._get_model_registry_store") as m:
         mock_store = mock.MagicMock()
@@ -205,7 +208,7 @@ def test_log_batch_api_req(mock_get_request_json):
     json_response = json.loads(response.get_data())
     assert json_response["error_code"] == ErrorCode.Name(INVALID_PARAMETER_VALUE)
     assert (
-        "Batched logging API requests must be at most %s bytes" % MAX_BATCH_LOG_REQUEST_SIZE
+        f"Batched logging API requests must be at most {MAX_BATCH_LOG_REQUEST_SIZE} bytes"
         in json_response["message"]
     )
 
@@ -223,21 +226,15 @@ def test_catch_mlflow_exception():
     assert json_response["message"] == "test error"
 
 
-def test_mlflow_server_with_installed_plugin(tmpdir):
+def test_mlflow_server_with_installed_plugin(tmp_path, monkeypatch):
     """This test requires the package in tests/resources/mlflow-test-plugin to be installed"""
     from mlflow_test_plugin.file_store import PluginFileStore
 
-    env = {
-        BACKEND_STORE_URI_ENV_VAR: "file-plugin:%s" % tmpdir.strpath,
-    }
-    with mock.patch.dict(os.environ, env):
-        mlflow.server.handlers._tracking_store = None
-        try:
-            plugin_file_store = mlflow.server.handlers._get_tracking_store()
-        finally:
-            mlflow.server.handlers._tracking_store = None
-        assert isinstance(plugin_file_store, PluginFileStore)
-        assert plugin_file_store.is_plugin
+    monkeypatch.setenv(BACKEND_STORE_URI_ENV_VAR, f"file-plugin:{tmp_path}")
+    monkeypatch.setattr(mlflow.server.handlers, "_tracking_store", None)
+    plugin_file_store = mlflow.server.handlers._get_tracking_store()
+    assert isinstance(plugin_file_store, PluginFileStore)
+    assert plugin_file_store.is_plugin
 
 
 def jsonify(obj):
@@ -703,37 +700,47 @@ def test_delete_model_version_tag(mock_get_request_message, mock_model_registry_
     assert args == {"name": name, "version": version, "key": key}
 
 
-@pytest.mark.skipif(is_windows(), reason="This test fails on Windows")
-@pytest.mark.parametrize(
-    ("file_path", "expected_mime_type"),
-    [
-        ("/a/b/c.txt", "text/plain"),
-        ("c.txt", "text/plain"),
-        ("c.pkl", "application/octet-stream"),
-        ("/a/b/c.pkl", "application/octet-stream"),
-        ("/a/b/c.png", "image/png"),
-        ("/a/b/c.pdf", "application/pdf"),
-        ("/a/b/MLmodel", "text/plain"),
-        ("/a/b/mlproject", "text/plain"),
-    ],
-)
-def test_guess_mime_type(file_path, expected_mime_type):
-    assert _guess_mime_type(file_path) == expected_mime_type
+def test_set_registered_model_alias(mock_get_request_message, mock_model_registry_store):
+    name = "model1"
+    alias = "test_alias"
+    version = "1"
+    mock_get_request_message.return_value = SetRegisteredModelAlias(
+        name=name, alias=alias, version=version
+    )
+    _set_registered_model_alias()
+    _, args = mock_model_registry_store.set_registered_model_alias.call_args
+    assert args == {"name": name, "alias": alias, "version": version}
 
 
-@pytest.mark.skipif(not is_windows(), reason="This test only passes on Windows")
-@pytest.mark.parametrize(
-    ("file_path", "expected_mime_type"),
-    [
-        ("C:\\a\\b\\c.txt", "text/plain"),
-        ("c.txt", "text/plain"),
-        ("c.pkl", "application/octet-stream"),
-        ("C:\\a\\b\\c.pkl", "application/octet-stream"),
-        ("C:\\a\\b\\c.png", "image/png"),
-        ("C:\\a\\b\\c.pdf", "application/pdf"),
-        ("C:\\a\\b\\MLmodel", "text/plain"),
-        ("C:\\a\\b\\mlproject", "text/plain"),
-    ],
-)
-def test_guess_mime_type_on_windows(file_path, expected_mime_type):
-    assert _guess_mime_type(file_path) == expected_mime_type
+def test_delete_registered_model_alias(mock_get_request_message, mock_model_registry_store):
+    name = "model1"
+    alias = "test_alias"
+    mock_get_request_message.return_value = DeleteRegisteredModelAlias(name=name, alias=alias)
+    _delete_registered_model_alias()
+    _, args = mock_model_registry_store.delete_registered_model_alias.call_args
+    assert args == {"name": name, "alias": alias}
+
+
+def test_get_model_version_by_alias(mock_get_request_message, mock_model_registry_store):
+    name = "model1"
+    alias = "test_alias"
+    mock_get_request_message.return_value = GetModelVersionByAlias(name=name, alias=alias)
+    mvd = ModelVersion(
+        name="model1",
+        version="5",
+        creation_timestamp=1,
+        last_updated_timestamp=12,
+        description="v 5",
+        user_id="u1",
+        current_stage="Production",
+        source="A/B",
+        run_id=uuid.uuid4().hex,
+        status="READY",
+        status_message=None,
+        aliases=["test_alias"],
+    )
+    mock_model_registry_store.get_model_version_by_alias.return_value = mvd
+    resp = _get_model_version_by_alias()
+    _, args = mock_model_registry_store.get_model_version_by_alias.call_args
+    assert args == {"name": name, "alias": alias}
+    assert json.loads(resp.get_data()) == {"model_version": jsonify(mvd)}

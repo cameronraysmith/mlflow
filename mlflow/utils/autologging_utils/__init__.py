@@ -1,9 +1,10 @@
 # pylint: disable=unused-wildcard-import,wildcard-import
 
+import contextlib
 import inspect
 import logging
 import time
-import contextlib
+from typing import List
 
 import mlflow
 from mlflow.entities import Metric
@@ -16,13 +17,27 @@ from mlflow.utils.validation import MAX_METRICS_PER_BATCH
 _logger = logging.getLogger(__name__)
 
 # Import autologging utilities used by this module
+from mlflow.utils.autologging_utils.client import MlflowAutologgingQueueingClient  # noqa: F401
+from mlflow.utils.autologging_utils.events import AutologgingEventLogger
 from mlflow.utils.autologging_utils.logging_and_warnings import (
     set_mlflow_events_and_warnings_behavior_globally,
     set_non_mlflow_warnings_behavior_for_current_thread,
 )
-from mlflow.utils.autologging_utils.safety import (
-    update_wrapper_extended,
+
+# Wildcard import other autologging utilities (e.g. safety utilities, event logging utilities) used
+# in autologging integration implementations, which reference them via the
+# `mlflow.utils.autologging_utils` module
+from mlflow.utils.autologging_utils.safety import (  # noqa: F401
+    ExceptionSafeAbstractClass,
+    ExceptionSafeClass,
+    PatchFunction,
+    exception_safe_function_for_class,
+    is_testing,
+    picklable_exception_safe_function,
     revert_patches,
+    safe_patch,
+    update_wrapper_extended,
+    with_managed_run,
 )
 from mlflow.utils.autologging_utils.versioning import (
     FLAVOR_TO_MODULE_NAME_AND_VERSION_INFO_KEY,
@@ -30,19 +45,10 @@ from mlflow.utils.autologging_utils.versioning import (
     is_flavor_supported_for_associated_package_versions,
 )
 
-# Wildcard import other autologging utilities (e.g. safety utilities, event logging utilities) used
-# in autologging integration implementations, which reference them via the
-# `mlflow.utils.autologging_utils` module
-from mlflow.utils.autologging_utils.safety import *
-from mlflow.utils.autologging_utils.events import *
-from mlflow.utils.autologging_utils.client import *
-
-
 INPUT_EXAMPLE_SAMPLE_ROWS = 5
 ENSURE_AUTOLOGGING_ENABLED_TEXT = (
     "please ensure that autologging is enabled before constructing the dataset."
 )
-_AUTOLOGGING_TEST_MODE_ENV_VAR = "MLFLOW_AUTOLOGGING_TESTING"
 
 # Flag indicating whether autologging is globally disabled for all integrations.
 _AUTOLOGGING_GLOBALLY_DISABLED = False
@@ -96,11 +102,10 @@ def get_mlflow_run_params_for_fn_args(fn, args, kwargs, unlogged=None):
         }
     )
     # Filter out any parameters that should not be logged, as specified by the `unlogged` parameter
-    params_to_log = {key: value for key, value in params_to_log.items() if key not in unlogged}
-    return params_to_log
+    return {key: value for key, value in params_to_log.items() if key not in unlogged}
 
 
-def log_fn_args_as_params(fn, args, kwargs, unlogged=None):  # pylint: disable=W0102
+def log_fn_args_as_params(fn, args, kwargs, unlogged=None):
     """
     Log arguments explicitly passed to a function as MLflow Run parameters to the current active
     MLflow Run.
@@ -179,6 +184,15 @@ def resolve_input_example_and_signature(
             model_signature = infer_model_signature(input_example)
         except Exception as e:
             model_signature_user_msg = "Failed to infer model signature: " + str(e)
+
+    # disable input_example signature inference in model logging if `log_model_signature`
+    # is set to `False` or signature inference in autologging fails
+    if (
+        model_signature is None
+        and input_example is not None
+        and (not log_model_signature or model_signature_user_msg is not None)
+    ):
+        model_signature = False
 
     if log_input_example and input_example_user_msg is not None:
         logger.warning(input_example_user_msg)
@@ -473,6 +487,34 @@ def disable_autologging():
     _AUTOLOGGING_GLOBALLY_DISABLED = True
     yield None
     _AUTOLOGGING_GLOBALLY_DISABLED = False
+
+
+@contextlib.contextmanager
+def disable_discrete_autologging(flavors_to_disable: List[str]) -> None:
+    """
+    Context manager for disabling specific autologging integrations temporarily while another
+    flavor's autologging is activated. This context wrapper is useful in the event that, for
+    example, a particular library calls upon another library within a training API that has a
+    current MLflow autologging integration.
+    For instance, the transformers library's Trainer class, when running metric scoring,
+    builds a sklearn model and runs evaluations as part of its accuracy scoring. Without this
+    temporary autologging disabling, a new run will be generated that contains a sklearn model
+    that holds no use for tracking purposes as it is only used during the metric evaluation phase
+    of training.
+    :param flavors_to_disable: A list of flavors that need to be temporarily disabled while
+                               executing another flavor's autologging to prevent spurious run
+                               logging of unrelated models, metrics, and parameters.
+    """
+    enabled_flavors = []
+    for flavor in flavors_to_disable:
+        if not autologging_is_disabled(flavor):
+            enabled_flavors.append(flavor)
+            autolog_func = getattr(mlflow, flavor)
+            autolog_func.autolog(disable=True)
+    yield
+    for flavor in enabled_flavors:
+        autolog_func = getattr(mlflow, flavor)
+        autolog_func.autolog(disable=False)
 
 
 def _get_new_training_session_class():

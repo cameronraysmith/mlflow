@@ -2,8 +2,9 @@ import uuid
 
 from mlflow.entities.model_registry.model_version import ModelVersion
 from mlflow.entities.model_registry.model_version_status import ModelVersionStatus
-from mlflow.entities.model_registry.registered_model import RegisteredModel
 from mlflow.entities.model_registry.model_version_tag import ModelVersionTag
+from mlflow.entities.model_registry.registered_model import RegisteredModel
+
 from tests.helper_functions import random_str
 
 
@@ -21,6 +22,7 @@ def _check(
     status,
     status_message,
     tags,
+    aliases,
 ):
     assert isinstance(model_version, ModelVersion)
     assert model_version.name == name
@@ -35,6 +37,7 @@ def _check(
     assert model_version.status == status
     assert model_version.status_message == status_message
     assert model_version.tags == tags
+    assert model_version.aliases == aliases
 
 
 def test_creation_and_hydration():
@@ -44,6 +47,7 @@ def test_creation_and_hydration():
     run_id = uuid.uuid4().hex
     run_link = "http://localhost:5000/path/to/run"
     tags = [ModelVersionTag("key", "value"), ModelVersionTag("randomKey", "not a random value")]
+    aliases = ["test_alias"]
     mvd = ModelVersion(
         name,
         "5",
@@ -58,6 +62,7 @@ def test_creation_and_hydration():
         "Model version #5 is ready to use.",
         tags,
         run_link,
+        aliases,
     )
     _check(
         mvd,
@@ -73,6 +78,7 @@ def test_creation_and_hydration():
         "READY",
         "Model version #5 is ready to use.",
         {tag.key: tag.value for tag in (tags or [])},
+        ["test_alias"],
     )
 
     expected_dict = {
@@ -89,6 +95,7 @@ def test_creation_and_hydration():
         "status": "READY",
         "status_message": "Model version #5 is ready to use.",
         "tags": {tag.key: tag.value for tag in (tags or [])},
+        "aliases": ["test_alias"],
     }
     model_version_as_dict = dict(mvd)
     assert model_version_as_dict == expected_dict
@@ -100,6 +107,7 @@ def test_creation_and_hydration():
     assert proto.status_message == "Model version #5 is ready to use."
     assert {tag.key for tag in proto.tags} == {"key", "randomKey"}
     assert {tag.value for tag in proto.tags} == {"value", "not a random value"}
+    assert proto.aliases == ["test_alias"]
     mvd_2 = ModelVersion.from_proto(proto)
     _check(
         mvd_2,
@@ -115,6 +123,7 @@ def test_creation_and_hydration():
         "READY",
         "Model version #5 is ready to use.",
         {tag.key: tag.value for tag in (tags or [])},
+        ["test_alias"],
     )
 
     expected_dict.update({"registered_model": RegisteredModel(name)})
@@ -134,6 +143,7 @@ def test_creation_and_hydration():
         "READY",
         "Model version #5 is ready to use.",
         {tag.key: tag.value for tag in (tags or [])},
+        ["test_alias"],
     )
 
 
@@ -152,10 +162,11 @@ def test_string_repr():
         status="PENDING_REGISTRATION",
         status_message="Copying!",
         tags=[],
+        aliases=[],
     )
 
     assert (
-        str(model_version) == "<ModelVersion: creation_timestamp=12, "
+        str(model_version) == "<ModelVersion: aliases=[], creation_timestamp=12, "
         "current_stage='Archived', description='This is a test "
         "model.', last_updated_timestamp=100, "
         "name='myname', "

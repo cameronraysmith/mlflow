@@ -1,33 +1,31 @@
 import importlib
 import json
 import math
-from collections import namedtuple
-from packaging.version import Version
-import yaml
 import pathlib
-
-import pytest
+from collections import namedtuple
 from unittest import mock
 
 import numpy as np
 import pandas as pd
-
 import pyspark
+import pytest
+import yaml
+from packaging.version import Version
 from pyspark.ml import Pipeline
-from pyspark.ml.evaluation import (
-    BinaryClassificationEvaluator,
-    MulticlassClassificationEvaluator,
-    RegressionEvaluator,
-)
-from pyspark.ml.linalg import Vectors
-from pyspark.ml.regression import LinearRegression, LinearRegressionModel
 from pyspark.ml.classification import (
     LinearSVC,
     LogisticRegression,
     MultilayerPerceptronClassifier,
     OneVsRest,
 )
-from pyspark.ml.feature import HashingTF, Tokenizer, VectorAssembler, StringIndexer, IndexToString
+from pyspark.ml.evaluation import (
+    BinaryClassificationEvaluator,
+    MulticlassClassificationEvaluator,
+    RegressionEvaluator,
+)
+from pyspark.ml.feature import HashingTF, IndexToString, StringIndexer, Tokenizer, VectorAssembler
+from pyspark.ml.linalg import Vectors
+from pyspark.ml.regression import LinearRegression, LinearRegressionModel
 from pyspark.ml.tuning import CrossValidator, ParamGridBuilder, TrainValidationSplit
 from pyspark.sql import SparkSession
 
@@ -37,24 +35,23 @@ from mlflow.entities import RunStatus
 from mlflow.models import Model
 from mlflow.models.utils import _read_example
 from mlflow.pyspark.ml import (
-    _should_log_model,
+    _gen_estimator_metadata,
     _get_instance_param_map,
     _get_instance_param_map_recursively,
-    _get_warning_msg_for_skip_log_model,
-    _get_warning_msg_for_fit_call_with_a_list_of_params,
-    _gen_estimator_metadata,
     _get_tuning_param_maps,
+    _get_warning_msg_for_fit_call_with_a_list_of_params,
+    _get_warning_msg_for_skip_log_model,
+    _should_log_model,
 )
 from mlflow.pyspark.ml._autolog import cast_spark_df_with_vector_to_array, get_feature_cols
-from mlflow.utils.mlflow_tags import MLFLOW_PARENT_RUN_ID, MLFLOW_AUTOLOGGING
 from mlflow.utils import _truncate_dict
+from mlflow.utils.mlflow_tags import MLFLOW_AUTOLOGGING, MLFLOW_PARENT_RUN_ID
 from mlflow.utils.validation import (
-    MAX_PARAM_VAL_LENGTH,
     MAX_ENTITY_KEY_LENGTH,
+    MAX_PARAM_VAL_LENGTH,
 )
 
 from tests.helper_functions import AnyStringWith
-
 
 MODEL_DIR = "model"
 MLFLOW_PARENT_RUN_ID = "mlflow.parentRunId"
@@ -62,9 +59,8 @@ MLFLOW_PARENT_RUN_ID = "mlflow.parentRunId"
 
 @pytest.fixture(scope="module")
 def spark_session():
-    session = SparkSession.builder.master("local[*]").getOrCreate()
-    yield session
-    session.stop()
+    with SparkSession.builder.master("local[*]").getOrCreate() as session:
+        yield session
 
 
 @pytest.fixture(scope="module")
@@ -240,6 +236,22 @@ def test_autolog_does_not_terminate_active_run(dataset_binomial):
     mlflow.end_run()
 
 
+def test_extra_tags_spark_autolog(dataset_binomial):
+    mlflow.pyspark.ml.autolog()
+    lr = LinearRegression()
+    lr.fit(dataset_binomial)
+    assert mlflow.active_run() is None
+
+
+def test_extra_tags_spark_autolog(dataset_binomial):
+    mlflow.pyspark.ml.autolog(extra_tags={"test_tag": "spark_autolog"})
+    lr = LinearRegression()
+    lr.fit(dataset_binomial)
+    run = mlflow.last_active_run()
+    assert run.data.tags["test_tag"] == "spark_autolog"
+    assert run.data.tags[mlflow.utils.mlflow_tags.MLFLOW_AUTOLOGGING] == "pyspark.ml"
+
+
 def test_meta_estimator_fit(dataset_binomial):
     mlflow.pyspark.ml.autolog()
     with mlflow.start_run() as run:
@@ -256,7 +268,7 @@ def test_meta_estimator_fit(dataset_binomial):
     assert loaded_model.stages[0].uid == ova_model.uid
 
     # assert no nested run spawned
-    query = "tags.{} = '{}'".format(MLFLOW_PARENT_RUN_ID, run.info.run_id)
+    query = f"tags.{MLFLOW_PARENT_RUN_ID} = '{run.info.run_id}'"
     assert len(mlflow.search_runs([run.info.experiment_id])) == 1
     assert len(mlflow.search_runs([run.info.experiment_id], query)) == 0
 
@@ -388,10 +400,11 @@ def test_should_log_model_with_wildcards_in_allowlist(dataset_binomial, dataset_
 
 
 def test_log_stage_type_params(spark_session):
-    from pyspark.ml.base import Estimator, Transformer, Model as SparkModel
+    from pyspark.ml.base import Estimator, Transformer
+    from pyspark.ml.base import Model as SparkModel
     from pyspark.ml.evaluation import Evaluator
-    from pyspark.ml.param import Param, Params
     from pyspark.ml.feature import Binarizer, OneHotEncoder
+    from pyspark.ml.param import Param, Params
 
     class TestingEstimator(Estimator):
         transformer = Param(Params._dummy(), "transformer", "a transformer param")
@@ -617,20 +630,16 @@ def test_param_search_estimator(  # pylint: disable=unused-argument
 def test_get_params_to_log(spark_session):  # pylint: disable=unused-argument
     lor = LogisticRegression(maxIter=3, standardization=False)
     lor_params = get_params_to_log(lor)
-    assert (
-        lor_params["maxIter"] == 3
-        and not lor_params["standardization"]
-        and lor_params["family"] == lor.getOrDefault(lor.family)
-    )
+    assert lor_params["maxIter"] == 3
+    assert not lor_params["standardization"]
+    assert lor_params["family"] == lor.getOrDefault(lor.family)
 
     ova = OneVsRest(classifier=lor, labelCol="abcd")
     ova_params = get_params_to_log(ova)
-    assert (
-        ova_params["classifier"] == "LogisticRegression"
-        and ova_params["labelCol"] == "abcd"
-        and ova_params["LogisticRegression.maxIter"] == 3
-        and ova_params["LogisticRegression.family"] == lor.getOrDefault(lor.family)
-    )
+    assert ova_params["classifier"] == "LogisticRegression"
+    assert ova_params["labelCol"] == "abcd"
+    assert ova_params["LogisticRegression.maxIter"] == 3
+    assert ova_params["LogisticRegression.family"] == lor.getOrDefault(lor.family)
 
     tokenizer = Tokenizer(inputCol="text", outputCol="words")
     hashing_tf = HashingTF(inputCol=tokenizer.getOutputCol(), outputCol="features")
@@ -647,10 +656,8 @@ def test_get_params_to_log(spark_session):  # pylint: disable=unused-argument
     assert nested_pipeline_params["OneVsRest.classifier"] == "LogisticRegression"
 
     for params_to_test in [pipeline_params, nested_pipeline_params]:
-        assert (
-            params_to_test["Tokenizer.inputCol"] == "text"
-            and params_to_test["Tokenizer.outputCol"] == "words"
-        )
+        assert params_to_test["Tokenizer.inputCol"] == "text"
+        assert params_to_test["Tokenizer.outputCol"] == "words"
         assert params_to_test["HashingTF.outputCol"] == "features"
         assert params_to_test["OneVsRest.classifier"] == "LogisticRegression"
         assert params_to_test["LogisticRegression.maxIter"] == 3
@@ -721,6 +728,61 @@ def test_gen_estimator_metadata(spark_session):  # pylint: disable=unused-argume
         metadata.uid_to_indexed_name_map[metadata.param_search_estimators[0].uid]
         == "CrossValidator"
     )
+
+
+@pytest.mark.parametrize("log_datasets", [True, False])
+def test_basic_post_training_datasets_autologging(dataset_iris_binomial, log_datasets):
+    mlflow.pyspark.ml.autolog(log_datasets=log_datasets)
+    estimator = LogisticRegression(maxIter=1, family="binomial", regParam=5.0, fitIntercept=False)
+
+    with mlflow.start_run() as run:
+        estimator.fit(dataset_iris_binomial)
+
+    run_id = run.info.run_id
+    client = MlflowClient()
+    dataset_inputs = client.get_run(run_id).inputs.dataset_inputs
+    if log_datasets:
+        assert len(dataset_inputs) == 1
+        assert dataset_inputs[0].dataset.source_type == "code"
+    else:
+        assert len(dataset_inputs) == 0
+
+
+def test_post_training_datasets_with_evaluate_autologging(dataset_iris_binomial):
+    mlflow.pyspark.ml.autolog(log_datasets=True, log_post_training_metrics=True)
+    estimator = LogisticRegression(maxIter=1, family="binomial", regParam=5.0, fitIntercept=False)
+    eval_dataset = dataset_iris_binomial.sample(fraction=0.3, seed=1)
+
+    with mlflow.start_run() as run:
+        model = estimator.fit(dataset_iris_binomial)
+        mce = MulticlassClassificationEvaluator(metricName="logLoss")
+        pred_result = model.transform(eval_dataset)
+        mce.evaluate(pred_result)
+
+    run_id = run.info.run_id
+    client = MlflowClient()
+    dataset_inputs = client.get_run(run_id).inputs.dataset_inputs
+    assert len(dataset_inputs) == 2
+    assert dataset_inputs[0].tags[0].value == "train"
+    assert dataset_inputs[1].tags[0].value == "eval"
+
+
+def test_post_training_datasets_without_explicit_run(dataset_iris_binomial):
+    mlflow.pyspark.ml.autolog(log_datasets=True, log_post_training_metrics=True)
+    estimator = LogisticRegression(maxIter=1, family="binomial", regParam=5.0, fitIntercept=False)
+    eval_dataset = dataset_iris_binomial.sample(fraction=0.3, seed=1)
+
+    model = estimator.fit(dataset_iris_binomial)
+    mce = MulticlassClassificationEvaluator(metricName="logLoss")
+    pred_result = model.transform(eval_dataset)
+    mce.evaluate(pred_result)
+
+    run_id = getattr(model, "_mlflow_run_id")
+    client = MlflowClient()
+    dataset_inputs = client.get_run(run_id).inputs.dataset_inputs
+    assert len(dataset_inputs) == 2
+    assert dataset_inputs[0].tags[0].value == "train"
+    assert dataset_inputs[1].tags[0].value == "eval"
 
 
 def test_basic_post_training_metric_autologging(dataset_iris_binomial):
@@ -1166,9 +1228,10 @@ def test_get_feature_cols_with_indexer_and_assembler(spark_session):
 
 
 def test_find_and_set_features_col_as_vector_if_needed(lr, dataset_binomial):
-    from mlflow.spark import _find_and_set_features_col_as_vector_if_needed
     from pyspark.ml.linalg import VectorUDT
     from pyspark.sql.utils import IllegalArgumentException
+
+    from mlflow.spark import _find_and_set_features_col_as_vector_if_needed
 
     pipeline_model = lr.fit(dataset_binomial)
     df_with_array_features = cast_spark_df_with_vector_to_array(dataset_binomial)

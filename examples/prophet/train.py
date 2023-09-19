@@ -1,9 +1,12 @@
-import mlflow
 import json
-import pandas as pd
+
 import numpy as np
+import pandas as pd
 from prophet import Prophet, serialize
 from prophet.diagnostics import cross_validation, performance_metrics
+
+import mlflow
+from mlflow.models import infer_signature
 
 SOURCE_DATA = (
     "https://raw.githubusercontent.com/facebook/prophet/master/examples/example_retail_sales.csv"
@@ -38,7 +41,11 @@ with mlflow.start_run():
     print(f"Logged Metrics: \n{json.dumps(metrics, indent=2)}")
     print(f"Logged Params: \n{json.dumps(params, indent=2)}")
 
-    mlflow.prophet.log_model(model, artifact_path=ARTIFACT_PATH)
+    train = model.history
+    predictions = model.predict(model.make_future_dataframe(30))
+    signature = infer_signature(train, predictions)
+
+    mlflow.prophet.log_model(model, artifact_path=ARTIFACT_PATH, signature=signature)
     mlflow.log_params(params)
     mlflow.log_metrics(metrics)
     model_uri = mlflow.get_artifact_uri(ARTIFACT_PATH)

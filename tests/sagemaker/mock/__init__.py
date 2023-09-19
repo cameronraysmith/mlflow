@@ -1,13 +1,11 @@
-import time
 import json
+import time
 from collections import namedtuple
 from datetime import datetime
 
-from moto.core import DEFAULT_ACCOUNT_ID
-from moto.core import BaseBackend, BaseModel
-from moto.core.responses import BaseResponse
+from moto.core import DEFAULT_ACCOUNT_ID, BackendDict, BaseBackend, BaseModel
 from moto.core.models import base_decorator
-from moto.core import BackendDict
+from moto.core.responses import BaseResponse
 
 SageMakerResourceWithArn = namedtuple("SageMakerResourceWithArn", ["resource", "arn"])
 
@@ -34,11 +32,13 @@ class SageMakerResponse(BaseResponse):
         config_name = self.request_params["EndpointConfigName"]
         production_variants = self.request_params.get("ProductionVariants")
         tags = self.request_params.get("Tags", [])
+        async_inference_config = self.request_params.get("AsyncInferenceConfig")
         new_config = self.sagemaker_backend.create_endpoint_config(
             config_name=config_name,
             production_variants=production_variants,
             tags=tags,
             region_name=self.region,
+            async_inference_config=async_inference_config,
         )
         return json.dumps({"EndpointConfigArn": new_config.arn})
 
@@ -311,8 +311,7 @@ class SageMakerBackend(BaseBackend):
         specified SageMaker URLs to the mocked SageMaker backend.
         """
         urls_module_name = "tests.sagemaker.mock.mock_sagemaker_urls"
-        urls_module = __import__(urls_module_name, fromlist=["url_bases", "url_paths"])
-        return urls_module
+        return __import__(urls_module_name, fromlist=["url_bases", "url_paths"])
 
     def _get_base_arn(self, region_name):
         """
@@ -322,7 +321,9 @@ class SageMakerBackend(BaseBackend):
             region_name=region_name, account_id=DEFAULT_ACCOUNT_ID
         )
 
-    def create_endpoint_config(self, config_name, production_variants, tags, region_name):
+    def create_endpoint_config(
+        self, config_name, production_variants, tags, region_name, async_inference_config
+    ):
         """
         Modifies backend state during calls to the SageMaker "CreateEndpointConfig" API
         documented here:
@@ -344,7 +345,10 @@ class SageMakerBackend(BaseBackend):
                 )
 
         new_config = EndpointConfig(
-            config_name=config_name, production_variants=production_variants, tags=tags
+            config_name=config_name,
+            production_variants=production_variants,
+            tags=tags,
+            async_inference_config=async_inference_config,
         )
         new_config_arn = self._get_base_arn(region_name=region_name) + new_config.arn_descriptor
         new_resource = SageMakerResourceWithArn(resource=new_config, arn=new_config_arn)
@@ -507,7 +511,7 @@ class SageMakerBackend(BaseBackend):
             summaries.append(summary)
         return summaries
 
-    def list_tags(self, resource_arn, region_name):
+    def list_tags(self, resource_arn, region_name):  # pylint: disable=unused-argument
         """
         Modifies backend state during calls to the SageMaker "ListTags" API
         https://docs.aws.amazon.com/sagemaker/latest/APIReference/API_ListTags.html
@@ -697,7 +701,7 @@ class Endpoint(TimestampedResource):
 
     @property
     def arn_descriptor(self):
-        return ":endpoint/{endpoint_name}".format(endpoint_name=self.endpoint_name)
+        return f":endpoint/{self.endpoint_name}"
 
     @property
     def status(self):
@@ -753,7 +757,7 @@ class TransformJob(TimestampedResource):
 
     @property
     def arn_descriptor(self):
-        return ":transform-job/{job_name}".format(job_name=self.job_name)
+        return f":transform-job/{self.job_name}"
 
     @property
     def status(self):
@@ -887,14 +891,13 @@ class EndpointSummary:
 
     @property
     def response_object(self):
-        response = {
+        return {
             "EndpointName": self.endpoint.endpoint_name,
             "CreationTime": self.endpoint.creation_time,
             "LastModifiedTime": self.endpoint.last_modified_time,
             "EndpointStatus": self.endpoint.status,
             "EndpointArn": self.arn,
         }
-        return response
 
 
 class EndpointDescription:
@@ -911,7 +914,7 @@ class EndpointDescription:
 
     @property
     def response_object(self):
-        response = {
+        return {
             "EndpointName": self.endpoint.endpoint_name,
             "EndpointArn": self.arn,
             "EndpointConfigName": self.endpoint.config_name,
@@ -920,7 +923,6 @@ class EndpointDescription:
             "CreationTime": self.endpoint.creation_time,
             "LastModifiedTime": self.endpoint.last_modified_time,
         }
-        return response
 
 
 class EndpointConfig(TimestampedResource):
@@ -929,15 +931,16 @@ class EndpointConfig(TimestampedResource):
     and manage EndpointConfigs.
     """
 
-    def __init__(self, config_name, production_variants, tags):
+    def __init__(self, config_name, production_variants, tags, async_inference_config=None):
         super().__init__()
         self.config_name = config_name
         self.production_variants = production_variants
         self.tags = tags
+        self.async_inference_config = async_inference_config
 
     @property
     def arn_descriptor(self):
-        return ":endpoint-config/{config_name}".format(config_name=self.config_name)
+        return f":endpoint-config/{self.config_name}"
 
 
 class EndpointConfigSummary:
@@ -953,12 +956,11 @@ class EndpointConfigSummary:
 
     @property
     def response_object(self):
-        response = {
+        return {
             "EndpointConfigName": self.config.config_name,
             "EndpointArn": self.arn,
             "CreationTime": self.config.creation_time,
         }
-        return response
 
 
 class EndpointConfigDescription:
@@ -974,13 +976,13 @@ class EndpointConfigDescription:
 
     @property
     def response_object(self):
-        response = {
+        return {
             "EndpointConfigName": self.config.config_name,
             "EndpointConfigArn": self.arn,
             "ProductionVariants": self.config.production_variants,
             "CreationTime": self.config.creation_time,
+            "AsyncInferenceConfig": self.config.async_inference_config,
         }
-        return response
 
 
 class Model(TimestampedResource):
@@ -998,7 +1000,7 @@ class Model(TimestampedResource):
 
     @property
     def arn_descriptor(self):
-        return ":model/{model_name}".format(model_name=self.model_name)
+        return f":model/{self.model_name}"
 
 
 class ModelSummary:
@@ -1013,12 +1015,11 @@ class ModelSummary:
 
     @property
     def response_object(self):
-        response = {
+        return {
             "ModelArn": self.arn,
             "ModelName": self.model.model_name,
             "CreationTime": self.model.creation_time,
         }
-        return response
 
 
 class ModelDescription:
@@ -1033,7 +1034,7 @@ class ModelDescription:
 
     @property
     def response_object(self):
-        response = {
+        return {
             "ModelArn": self.arn,
             "ModelName": self.model.model_name,
             "PrimaryContainer": self.model.primary_container,
@@ -1041,7 +1042,6 @@ class ModelDescription:
             "VpcConfig": self.model.vpc_config if self.model.vpc_config else {},
             "CreationTime": self.model.creation_time,
         }
-        return response
 
 
 class TransformJobSummary:
@@ -1057,14 +1057,13 @@ class TransformJobSummary:
 
     @property
     def response_object(self):
-        response = {
+        return {
             "TransformJobName": self.transform_job.job_name,
             "TransformJobArn": self.arn,
             "CreationTime": self.transform_job.creation_time,
             "LastModifiedTime": self.transform_job.last_modified_time,
             "TransformJobStatus": self.transform_job.status,
         }
-        return response
 
 
 class TransformJobDescription:
@@ -1080,7 +1079,7 @@ class TransformJobDescription:
 
     @property
     def response_object(self):
-        response = {
+        return {
             "TransformJobName": self.transform_job.job_name,
             "TransformJobArn": self.arn,
             "CreationTime": self.transform_job.creation_time,
@@ -1088,7 +1087,6 @@ class TransformJobDescription:
             "TransformJobStatus": self.transform_job.status,
             "ModelName": self.transform_job.model_name,
         }
-        return response
 
 
 # Create a SageMaker backend for EC2 region: "us-west-2"

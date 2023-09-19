@@ -1,5 +1,6 @@
+import importlib
 import logging
-from typing import Dict, Any, Tuple, TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, Dict, Tuple
 
 import pandas as pd
 
@@ -10,14 +11,14 @@ import mlflow
 from mlflow import MlflowException
 from mlflow.models import EvaluationMetric
 from mlflow.models.evaluation.default_evaluator import (
-    _get_regressor_metrics,
     _get_binary_classifier_metrics,
+    _get_regressor_metrics,
 )
 from mlflow.recipes.utils.metrics import RecipeMetric, _load_custom_metrics
 
 _logger = logging.getLogger(__name__)
 
-_AUTOML_DEFAULT_TIME_BUDGET = 30
+_AUTOML_DEFAULT_TIME_BUDGET = 600
 _MLFLOW_TO_FLAML_METRICS = {
     "mean_absolute_error": "mae",
     "mean_squared_error": "mse",
@@ -106,8 +107,6 @@ def _create_sklearn_metric_flaml(metric_name: str, coeff: int, avg: str = "binar
         weight_train=None,
         *args,
     ):
-        import importlib
-
         custom_metrics_mod = importlib.import_module("sklearn.metrics")
         eval_fn = getattr(custom_metrics_mod, metric_name)
         val_metric = coeff * eval_fn(y_val, estimator.predict(X_val), average=avg)
@@ -180,5 +179,5 @@ def _create_model_automl(
     except Exception as e:
         _logger.warning(e, exc_info=e, stack_info=True)
         raise MlflowException(
-            f"Error has occurred during training of AutoML model using FLAML: {repr(e)}"
+            f"Error has occurred during training of AutoML model using FLAML: {e!r}"
         )

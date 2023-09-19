@@ -1,6 +1,6 @@
 import React from 'react';
 import { IntlProvider } from 'react-intl';
-import { StaticRouter } from 'react-router-dom';
+import { StaticRouter } from '../../../../common/utils/RoutingUtils';
 import { ExperimentViewDescriptions } from './ExperimentViewDescriptions';
 
 export default {

@@ -1,20 +1,23 @@
 import copy
+
 import pytest
-from mlflow.exceptions import MlflowException
+
 from mlflow.entities import Metric, Param, RunTag
-from mlflow.protos.databricks_pb2 import ErrorCode, INVALID_PARAMETER_VALUE
+from mlflow.exceptions import MlflowException
+from mlflow.protos.databricks_pb2 import INVALID_PARAMETER_VALUE, ErrorCode
 from mlflow.utils.validation import (
-    path_not_unique,
     _is_numeric,
-    _validate_metric_name,
-    _validate_param_name,
-    _validate_tag_name,
-    _validate_run_id,
     _validate_batch_log_data,
     _validate_batch_log_limits,
-    _validate_experiment_artifact_location,
     _validate_db_type_string,
+    _validate_experiment_artifact_location,
     _validate_experiment_name,
+    _validate_metric_name,
+    _validate_model_alias_name,
+    _validate_param_name,
+    _validate_run_id,
+    _validate_tag_name,
+    path_not_unique,
 )
 
 GOOD_METRIC_OR_PARAM_NAMES = [
@@ -41,6 +44,42 @@ BAD_METRIC_OR_PARAM_NAMES = [
     "\\",
     "./",
     "/./",
+]
+
+GOOD_ALIAS_NAMES = [
+    "a",
+    "Ab-5_",
+    "test-alias",
+    "1a2b5cDeFgH",
+    "a" * 255,
+    "lates",
+    "v123_temp",
+    "123",
+    "123v",
+    "temp_V123",
+]
+
+BAD_ALIAS_NAMES = [
+    "",
+    ".",
+    "/",
+    "..",
+    "//",
+    "a b",
+    "a/./b",
+    "/a",
+    "a/",
+    ":",
+    "\\",
+    "./",
+    "/./",
+    "a" * 256,
+    None,
+    "$dgs",
+    "latest",
+    "Latest",
+    "v123",
+    "V1",
 ]
 
 
@@ -115,6 +154,18 @@ def test_validate_tag_name_bad(tag_name):
     assert e.value.error_code == ErrorCode.Name(INVALID_PARAMETER_VALUE)
 
 
+@pytest.mark.parametrize("alias_name", GOOD_ALIAS_NAMES)
+def test_validate_model_alias_name_good(alias_name):
+    _validate_model_alias_name(alias_name)
+
+
+@pytest.mark.parametrize("alias_name", BAD_ALIAS_NAMES)
+def test_validate_model_alias_name_bad(alias_name):
+    with pytest.raises(MlflowException, match="alias name") as e:
+        _validate_model_alias_name(alias_name)
+    assert e.value.error_code == ErrorCode.Name(INVALID_PARAMETER_VALUE)
+
+
 @pytest.mark.parametrize(
     "run_id",
     [
@@ -142,9 +193,9 @@ def test_validate_run_id_bad(run_id):
 
 
 def test_validate_batch_log_limits():
-    too_many_metrics = [Metric("metric-key-%s" % i, 1, 0, i * 2) for i in range(1001)]
-    too_many_params = [Param("param-key-%s" % i, "b") for i in range(101)]
-    too_many_tags = [RunTag("tag-key-%s" % i, "b") for i in range(101)]
+    too_many_metrics = [Metric(f"metric-key-{i}", 1, 0, i * 2) for i in range(1001)]
+    too_many_params = [Param(f"param-key-{i}", "b") for i in range(101)]
+    too_many_tags = [RunTag(f"tag-key-{i}", "b") for i in range(101)]
 
     good_kwargs = {"metrics": [], "params": [], "tags": []}
     bad_kwargs = {
