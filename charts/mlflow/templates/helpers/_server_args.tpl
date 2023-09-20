@@ -14,7 +14,7 @@
 
 {{/* mlflow server metrics */}}
 {{- define "mlflow.serverMetrics" -}}
-{{- if .Values.workers -}}
+{{- if .Values.metrics -}}
 --expose-prometheus=/metrics
 {{- end -}}
 {{- end -}}
@@ -70,6 +70,7 @@
                   (include "mlflow.serverWorkers" .)
                   (include "mlflow.serverMetrics" .)
                   (include "mlflow.defaultArtifactRoot" .)
+                  (include "mlflow.backendStoreUri" .)
                   (include "mlflow.proxyArtifacts" .)
                   (include "mlflow.artifactsDestination" .) -}}
 - mlflow
